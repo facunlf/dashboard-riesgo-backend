@@ -289,6 +289,7 @@ def fred_observations(series_id: str, api_key: str, start: str | None = None, en
         "api_key": api_key,
         "file_type": "json",
         "sort_order": "asc",
+        "limit": 100000,
     }
 
     if start:
@@ -326,31 +327,106 @@ def fetch_fred_latest(series_id: str, api_key: str):
         "series": series_id,
     }
 
+def fred_yoy_source_label(series_id: str):
+    labels = {
+        "PCEPILFE": "FRED / BEA Core PCE",
+    }
+    return labels.get(series_id, f"FRED {series_id}")
+
+
+def parse_observation_date(date_text: str):
+    return datetime.strptime(str(date_text)[:10], "%Y-%m-%d")
+
+
+def yoy_for_observation(observation: dict, observations: list[dict], series_id: str):
+    obs_date = observation["date"]
+    obs_month = obs_date[5:7]
+    obs_year = int(obs_date[:4])
+    previous_year_same_month = next(
+        (item for item in reversed(observations) if item["date"][:4] == str(obs_year - 1) and item["date"][5:7] == obs_month),
+        None,
+    )
+    if not previous_year_same_month:
+        raise ValueError(f"FRED {series_id}: no se encontró el mismo mes del año previo para {obs_date}")
+    yoy = ((observation["value"] / previous_year_same_month["value"]) - 1) * 100
+    return round(yoy, 2), previous_year_same_month
+
+
 def fetch_fred_yoy_latest(series_id: str, api_key: str):
-    observations = fred_observations(series_id, api_key)
+    # For current indicators, never infer a date from historical dashboard rows.
+    # Fetch a broad window from FRED, sort locally, select the latest valid observation,
+    # and reject clearly stale provider responses instead of showing an old date as current.
+    observations = fred_observations(series_id, api_key, "1990-01-01")
+    observations = sorted(observations, key=lambda x: x["date"])
+
     if len(observations) < 13:
         raise ValueError(f"FRED {series_id}: datos insuficientes para calcular interanual")
 
     latest = observations[-1]
-    latest_month = latest["date"][5:7]
-    latest_year = int(latest["date"][:4])
-    previous_year_same_month = next(
-        (obs for obs in reversed(observations) if obs["date"][:4] == str(latest_year - 1) and obs["date"][5:7] == latest_month),
-        None,
-    )
-    if not previous_year_same_month:
-        raise ValueError(f"FRED {series_id}: no se encontró el mismo mes del año previo")
+    latest_dt = parse_observation_date(latest["date"])
+    max_allowed_age_days = 550
+    if datetime.utcnow() - latest_dt > timedelta(days=max_allowed_age_days):
+        raise ValueError(
+            f"FRED {series_id}: última observación demasiado antigua ({latest['date']}); "
+            "no se actualiza para evitar mostrar un dato obsoleto como actual"
+        )
 
-    yoy = ((latest["value"] / previous_year_same_month["value"]) - 1) * 100
+    latest_yoy, previous_year_same_month = yoy_for_observation(latest, observations, series_id)
+
+    previous_month_yoy = None
+    previous_month = None
+    for candidate in reversed(observations[:-1]):
+        try:
+            previous_month_yoy, _ = yoy_for_observation(candidate, observations, series_id)
+            previous_month = candidate
+            break
+        except Exception:
+            continue
+
     return {
-        "latest": round(yoy, 2),
+        "latest": latest_yoy,
         "latestIndex": latest["value"],
         "previousIndex": previous_year_same_month["value"],
-        "previous": None,
-        "date": latest["date"][:7],
+        "previous": previous_month_yoy,
+        "previousDate": previous_month["date"] if previous_month else None,
+        "date": latest["date"],
         "series": series_id,
-        "source": "FRED CPILFESL",
+        "source": fred_yoy_source_label(series_id),
     }
+
+
+def fetch_fred_yoy_history(series_id: str, api_key: str, start: str, end: str):
+    """Return monthly YoY percentage changes for a FRED monthly index series."""
+    start_month = start[5:7] if len(start) >= 7 else "01"
+    extended_start = f"{max(1900, int(start[:4]) - 1)}-{start_month}-01"
+    observations = fred_observations(series_id, api_key, extended_start, end)
+    output = []
+
+    for obs in observations:
+        if obs["date"] < start:
+            continue
+
+        obs_year = int(obs["date"][:4])
+        obs_month = obs["date"][5:7]
+        previous_year_same_month = next(
+            (
+                item for item in observations
+                if item["date"][:4] == str(obs_year - 1)
+                and item["date"][5:7] == obs_month
+            ),
+            None,
+        )
+
+        if not previous_year_same_month:
+            continue
+
+        yoy = ((obs["value"] / previous_year_same_month["value"]) - 1) * 100
+        output.append({
+            "date": obs["date"],
+            "value": round(yoy, 2),
+        })
+
+    return output
 
 def fetch_fred_pair_spread(series_a: str, series_b: str, api_key: str):
     a = fetch_fred_latest(series_a, api_key)
@@ -366,135 +442,6 @@ def fetch_fred_pair_spread(series_a: str, series_b: str, api_key: str):
             series_b: b["latest"],
         },
     }
-
-def fetch_bls_series(series_id: str, start_year: int, end_year: int, registration_key: str | None = None):
-    body = {
-        "seriesid": [series_id],
-        "startyear": str(start_year),
-        "endyear": str(end_year),
-    }
-
-    if registration_key:
-        body["registrationKey"] = registration_key
-
-    payload = fetch_json(
-        "https://api.bls.gov/publicAPI/v2/timeseries/data/",
-        method="POST",
-        body=body,
-    )
-
-    series = payload.get("Results", {}).get("series", [{}])[0].get("data", [])
-
-    monthly = [
-        item for item in series
-        if str(item.get("period", "")).startswith("M") and item.get("period") != "M13"
-    ]
-
-    rows = []
-    for item in monthly:
-        raw_value = item.get("value")
-        if raw_value in (None, "", "-", "."):
-            continue
-
-        try:
-            numeric_value = float(raw_value)
-        except (TypeError, ValueError):
-            continue
-
-        month = item["period"][1:]
-        rows.append({
-            "date": f"{item['year']}-{month.zfill(2)}-01",
-            "value": numeric_value,
-            "year": int(item["year"]),
-            "month": int(month),
-        })
-
-    rows.sort(key=lambda x: x["date"])
-    return rows
-
-def fetch_bls_core_yoy(series_id: str, registration_key: str | None = None):
-    current_year = datetime.now().year
-    rows = fetch_bls_series(series_id, current_year - 2, current_year, registration_key)
-
-    if len(rows) < 13:
-        raise ValueError("BLS: datos insuficientes para calcular variación interanual")
-
-    latest = rows[-1]
-    previous_year_same_month = next(
-        (
-            item for item in rows
-            if item["month"] == latest["month"]
-            and item["year"] == latest["year"] - 1
-        ),
-        None,
-    )
-
-    if not previous_year_same_month:
-        raise ValueError("BLS: no se encontró el mismo mes del año previo")
-
-    yoy = ((latest["value"] / previous_year_same_month["value"]) - 1) * 100
-
-    return {
-        "latest": round(yoy, 2),
-        "latestIndex": latest["value"],
-        "previousIndex": previous_year_same_month["value"],
-        "date": latest["date"][:7],
-        "series": series_id,
-    }
-
-def fetch_bls_core_yoy_history(series_id: str, start_year: int, end_year: int, registration_key: str | None = None):
-    rows = fetch_bls_series(series_id, max(1990, start_year - 1), end_year, registration_key)
-    output = []
-
-    for row in rows:
-        if row["year"] < start_year:
-            continue
-
-        previous_year_same_month = next(
-            (
-                item for item in rows
-                if item["month"] == row["month"]
-                and item["year"] == row["year"] - 1
-            ),
-            None,
-        )
-
-        if not previous_year_same_month:
-            continue
-
-        yoy = ((row["value"] / previous_year_same_month["value"]) - 1) * 100
-        output.append({
-            "date": row["date"],
-            "value": round(yoy, 2),
-        })
-
-    return output
-
-def month_key(date_str: str):
-    return date_str[:7]
-
-def last_observation_per_month(observations):
-    out = {}
-    for obs in observations:
-        out[month_key(obs["date"])] = obs["value"]
-    return out
-
-
-def clamp(value, minimum=0, maximum=100):
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        value = 0
-    return max(minimum, min(maximum, value))
-
-def num(row, key, default=0):
-    try:
-        value = row.get(key, default)
-        if value in (None, "", ".", "-"):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 def score_range(value, low, high):
     if high == low:
@@ -691,6 +638,26 @@ def scenario_estimates(row):
 def weighted_drawdown_value(scenarios):
     return round(sum(abs(float(s["marketImpact"])) * float(s["probability"]) / 100 for s in scenarios), 1)
 
+def max_update_date(updates, keys=None):
+    selected = updates.items() if keys is None else ((key, updates.get(key)) for key in keys)
+    dates = []
+    for _key, item in selected:
+        if isinstance(item, dict) and item.get("date"):
+            dates.append(str(item["date"])[:10])
+    return sorted(dates)[-1] if dates else datetime.utcnow().strftime("%Y-%m-%d")
+
+def stamp_update(item: dict, calculation_date: str, source: str | None = None):
+    """Attach explicit data/calculation dates to an indicator update."""
+    if item is None:
+        item = {}
+    if source and not item.get("source"):
+        item["source"] = source
+    item["date"] = str(item.get("date") or calculation_date)[:10]
+    item["inputDataDate"] = item["date"]
+    item["calculatedAt"] = calculation_date
+    item["fetchedAt"] = calculation_date
+    return item
+
 def enrich_history_row(row):
     if "shippingStress" not in row or row.get("shippingStress") in (None, "", ".", "-"):
         row["shippingStress"] = historical_shipping_stress(row)
@@ -754,7 +721,7 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
         pass
 
     try:
-        core_history = fetch_bls_core_yoy_history(bls_series, start_year, end_year, bls_key)
+        core_history = fetch_fred_yoy_history("PCEPILFE", fred_key, start, end)
         for obs in core_history:
             date_key = month_key(obs["date"])
             monthly.setdefault(date_key, {"date": date_key})
@@ -1059,7 +1026,7 @@ def assess_macro_news_recession_score():
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO Fixed Logistics + PMI + Recession v3 del dashboard funcionando",
+        "message": "Backend PRO v20 Core PCE + fechas completas por indicador funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -1070,9 +1037,8 @@ def health():
         "message": "Backend Render funcionando",
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
-            "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
-            "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
-            "version": "pro-free-logistics-pmi-recession-history-v3",
+            "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
+            "version": "pro-free-logistics-pmi-recession-history-v7-complete-indicator-dates",
         }
     })
 
@@ -1085,17 +1051,7 @@ def official_data():
             os.environ.get("FRED_API_KEY", "").strip()
             or str(payload.get("fredKey", "")).strip()
         )
-
-        bls_key = (
-            os.environ.get("BLS_API_KEY", "").strip()
-            or str(payload.get("blsKey", "")).strip()
-        )
-
-        bls_series = (
-            os.environ.get("BLS_SERIES", "").strip()
-            or str(payload.get("blsSeries", "CUUR0000SA0L1E")).strip()
-            or "CUUR0000SA0L1E"
-        )
+        calculation_date = datetime.utcnow().strftime("%Y-%m-%d")
 
         out = {
             "ok": True,
@@ -1103,23 +1059,22 @@ def official_data():
             "updates": {},
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
-                "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
-                "blsSeries": bls_series,
-                "version": "pro-free-logistics-pmi-recession-history-v3",
+                "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
+                "version": "pro-free-logistics-pmi-recession-history-v7-complete-indicator-dates",
             }
         }
 
         if fred_key:
             for key, (series, label) in FRED_SERIES.items():
                 try:
-                    value = fetch_fred_latest(series, fred_key)
+                    value = stamp_update(fetch_fred_latest(series, fred_key), calculation_date, f"FRED {series}")
                     out["updates"][key] = value
                     out["messages"].append(f"{label} actualizado ({value['date']})")
                 except Exception as error:
                     out["messages"].append(f"Error {label}: {error}")
 
             try:
-                curve = fetch_fred_pair_spread("DGS10", "DGS2", fred_key)
+                curve = stamp_update(fetch_fred_pair_spread("DGS10", "DGS2", fred_key), calculation_date, "FRED DGS10-DGS2")
                 out["updates"]["yieldCurve10y2y"] = curve
                 out["messages"].append(f"Curva 10Y-2Y actualizada ({curve['date']})")
             except Exception as error:
@@ -1129,14 +1084,13 @@ def official_data():
             out["messages"].append("FRED_API_KEY no está configurada en Render")
 
         try:
-            gscpi = fetch_gscpi_latest()
+            gscpi = stamp_update(fetch_gscpi_latest(), calculation_date, "New York Fed GSCPI")
             out["updates"]["gscpi"] = gscpi
             out["messages"].append(f"Global Supply Chain Pressure Index actualizado ({gscpi['date']})")
         except Exception:
             if fred_key:
                 try:
-                    gscpi = fetch_fred_latest("GSCPI", fred_key)
-                    gscpi["source"] = "FRED GSCPI"
+                    gscpi = stamp_update(fetch_fred_latest("GSCPI", fred_key), calculation_date, "FRED GSCPI")
                     out["updates"]["gscpi"] = gscpi
                     out["messages"].append(f"Global Supply Chain Pressure Index actualizado ({gscpi['date']})")
                 except Exception:
@@ -1144,23 +1098,18 @@ def official_data():
             else:
                 out["messages"].append("Global Supply Chain Pressure Index no se actualizó; se conserva el último valor cargado")
 
-        try:
-            core = fetch_bls_core_yoy(bls_series, bls_key or None)
-            out["updates"]["coreInflation"] = core
-            out["messages"].append(f"Inflación core interanual actualizada ({core['date']})")
-        except Exception:
-            if fred_key:
-                try:
-                    core = fetch_fred_yoy_latest("CPILFESL", fred_key)
-                    out["updates"]["coreInflation"] = core
-                    out["messages"].append(f"Inflación core interanual actualizada con FRED ({core['date']})")
-                except Exception:
-                    out["messages"].append("Inflación core no se actualizó; se conserva el último valor cargado")
-            else:
-                out["messages"].append("Inflación core no se actualizó; se conserva el último valor cargado")
+        if fred_key:
+            try:
+                core = stamp_update(fetch_fred_yoy_latest("PCEPILFE", fred_key), calculation_date, "FRED / BEA Core PCE")
+                out["updates"]["coreInflation"] = core
+                out["messages"].append(f"Core PCE interanual actualizado ({core['date']})")
+            except Exception as error:
+                out["messages"].append(f"Core PCE no se actualizó desde FRED/BEA: {error}")
+        else:
+            out["messages"].append("Core PCE no se actualizó porque FRED_API_KEY no está configurada")
 
         try:
-            logistics = assess_logistics_stress_from_news()
+            logistics = stamp_update(assess_logistics_stress_from_news(), calculation_date, "Calculado (GDELT/logística)")
             out["updates"]["shippingStress"] = logistics
             out["logisticsStressNews"] = logistics
             out["messages"].append(
@@ -1172,20 +1121,42 @@ def official_data():
 
         try:
             pmi = assess_global_pmi_from_news()
-            out["globalPmiNews"] = pmi
             if pmi.get("latest") is not None:
+                pmi = stamp_update(pmi, calculation_date, "Calculado (GDELT PMI)")
                 out["updates"]["globalPMI"] = pmi
+                out["globalPmiNews"] = pmi
                 out["messages"].append(
                     f"PMI global estimado desde noticias: {pmi['latest']} "
                     f"(confianza {round(pmi.get('confidence', 0) * 100)}%)"
                 )
             else:
-                out["messages"].append("PMI global no pudo extraerse automáticamente desde noticias recientes")
+                # Si no se puede extraer un PMI textual fiable, igualmente devolvemos una fecha de cálculo
+                # y un proxy macro para que el indicador no quede sin fecha ni sin actualización.
+                proxy_row = {}
+                for key, item in out["updates"].items():
+                    if isinstance(item, dict) and item.get("latest") not in (None, "", ".", "-"):
+                        try:
+                            proxy_row[key] = float(item["latest"])
+                        except (TypeError, ValueError):
+                            pass
+                proxy_value = global_pmi_proxy(proxy_row)
+                pmi = stamp_update({
+                    "latest": proxy_value,
+                    "previous": None,
+                    "source": "Calculado (proxy macro)",
+                    "confidence": 0.20,
+                    "summary": "No se extrajo un valor fiable de PMI global desde titulares; se usa proxy macro calculado con estrés financiero/oferta y desempleo.",
+                    "articleCount": pmi.get("articleCount", 0),
+                    "sampleArticles": pmi.get("sampleArticles", []),
+                }, calculation_date, "Calculado (proxy macro)")
+                out["updates"]["globalPMI"] = pmi
+                out["globalPmiNews"] = pmi
+                out["messages"].append(f"PMI global calculado por proxy macro: {proxy_value} ({calculation_date})")
         except Exception as error:
             out["messages"].append(f"Error PMI global por noticias: {error}")
 
         try:
-            macro_news = assess_macro_news_recession_score()
+            macro_news = stamp_update(assess_macro_news_recession_score(), calculation_date, "Calculado (GDELT macro/recesión)")
             out["macroRecessionNews"] = macro_news
             out["updates"]["macroNewsRecession"] = macro_news
             out["messages"].append(
@@ -1195,6 +1166,48 @@ def official_data():
         except Exception as error:
             out["messages"].append(f"Error noticias macro/recesión: {error}")
 
+        # Fechas y valores calculados por indicador.
+        # El frontend también recalcula, pero enviar estos campos evita que los indicadores
+        # calculados queden sin fecha visible tras una actualización automática.
+        try:
+            row = {}
+            for key, item in out["updates"].items():
+                if isinstance(item, dict) and item.get("latest") not in (None, "", ".", "-"):
+                    try:
+                        row[key] = float(item["latest"])
+                    except (TypeError, ValueError):
+                        pass
+
+            if row:
+                row["supplyStress"] = supply_stress_value(row)
+                row["recessionRisk"] = recession_risk_value(row)
+
+                supply_date = max_update_date(out["updates"], ["brent", "gscpi", "shippingStress"])
+                recession_date = max_update_date(out["updates"], ["yieldCurve10y2y", "unemployment", "creditSpreads", "vix", "globalPMI", "macroNewsRecession"])
+
+                out["updates"]["supplyStress"] = {
+                    "latest": row["supplyStress"],
+                    "previous": None,
+                    "date": supply_date,
+                    "inputDataDate": supply_date,
+                    "calculatedAt": calculation_date,
+                    "fetchedAt": calculation_date,
+                    "source": "Calculado",
+                    "formula": "Brent 40% + GSCPI 30% + estrés logístico 30%",
+                }
+                out["updates"]["recessionRisk"] = {
+                    "latest": row["recessionRisk"],
+                    "previous": None,
+                    "date": recession_date,
+                    "inputDataDate": recession_date,
+                    "calculatedAt": calculation_date,
+                    "fetchedAt": calculation_date,
+                    "source": "Calculado",
+                    "formula": "25% curva + 20% desempleo + 20% HY OAS + 10% VIX + 15% PMI + 10% noticias macro",
+                }
+        except Exception as error:
+            out["messages"].append(f"Indicadores calculados sin fecha backend: {error}")
+
         return jsonify(out)
 
     except Exception as error:
@@ -1203,7 +1216,8 @@ def official_data():
 @app.post("/api/logistics-stress-news")
 def logistics_stress_news():
     try:
-        result = assess_logistics_stress_from_news()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        result = stamp_update(assess_logistics_stress_from_news(), today, "Calculado (GDELT/logística)")
         return jsonify({"ok": True, "result": result})
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
@@ -1211,7 +1225,12 @@ def logistics_stress_news():
 @app.post("/api/global-pmi-news")
 def global_pmi_news():
     try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
         result = assess_global_pmi_from_news()
+        if result.get("latest") is not None:
+            result = stamp_update(result, today, "Calculado (GDELT PMI)")
+        else:
+            result = stamp_update(result, today, "Calculado (GDELT PMI)")
         return jsonify({"ok": True, "result": result})
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
@@ -1219,7 +1238,8 @@ def global_pmi_news():
 @app.post("/api/macro-recession-news")
 def macro_recession_news():
     try:
-        result = assess_macro_news_recession_score()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        result = stamp_update(assess_macro_news_recession_score(), today, "Calculado (GDELT macro/recesión)")
         return jsonify({"ok": True, "result": result})
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
@@ -1230,8 +1250,6 @@ def history():
         payload = request.get_json(force=True, silent=True) or {}
 
         fred_key = os.environ.get("FRED_API_KEY", "").strip()
-        bls_key = os.environ.get("BLS_API_KEY", "").strip()
-        bls_series = os.environ.get("BLS_SERIES", "CUUR0000SA0L1E").strip() or "CUUR0000SA0L1E"
 
         if not fred_key:
             return jsonify({"ok": False, "error": "FRED_API_KEY no está configurada en Render"}), 400
@@ -1239,7 +1257,7 @@ def history():
         start = str(payload.get("start", "2003-01-01"))
         end = str(payload.get("end", datetime.now().strftime("%Y-%m-%d")))
 
-        rows = build_monthly_history(start, end, fred_key, bls_key or None, bls_series)
+        rows = build_monthly_history(start, end, fred_key, None, "")
 
         return jsonify({
             "ok": True,
