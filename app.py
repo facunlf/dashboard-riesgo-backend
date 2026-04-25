@@ -2,11 +2,12 @@ import os
 import json
 import urllib.parse
 import urllib.request
+import csv
 import re
 import io
 import zipfile
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -86,15 +87,172 @@ def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers:
             preview = raw[:160].replace("\n", " ")
             raise ValueError(f"Respuesta no JSON del proveedor: {preview}") from error
 
-def fetch_binary(url: str, headers: dict | None = None):
-    req_headers = headers or {}
-    req_headers.setdefault("User-Agent", "macro-risk-dashboard/1.0")
+def fetch_binary(url: str, headers: dict | None = None, timeout: int = 15):
+    req_headers = dict(headers or {})
+    req_headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 macro-risk-dashboard/1.0")
+    req_headers.setdefault("Accept", "text/csv,application/json,text/plain,text/html,*/*")
+    req_headers.setdefault("Accept-Language", "en-US,en;q=0.9,es;q=0.8")
     req = urllib.request.Request(url, headers=req_headers, method="GET")
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
         if not raw:
             raise ValueError("Respuesta vacía del proveedor")
         return raw
+
+def fetch_text(url: str, headers: dict | None = None, timeout: int = 15):
+    raw = fetch_binary(url, headers=headers, timeout=timeout)
+    return raw.decode("utf-8", errors="replace")
+
+def date_compact(value: str):
+    text = str(value or "")[:10]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text.replace("-", "")
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return (text + "-01").replace("-", "")
+    return datetime.utcnow().strftime("%Y%m%d")
+
+def parse_stooq_csv(raw: str):
+    observations = []
+    text = (raw or "").strip()
+    if not text:
+        return observations
+
+    # Stooq normally returns CSV: Date,Open,High,Low,Close,Volume
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        date = str(row.get("Date") or row.get("date") or "").strip()
+        close = parse_float_like(row.get("Close") or row.get("close"))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) and close is not None:
+            observations.append({"date": date, "value": close})
+
+    observations.sort(key=lambda x: x["date"])
+    return observations
+
+def fetch_sp500_stooq_history(start: str, end: str):
+    """Daily S&P 500 close from Stooq, used as long-history source.
+    Returns observations shaped like FRED: [{date: YYYY-MM-DD, value: close}].
+    The function tries a few symbol/interval variants because Stooq sometimes answers
+    differently depending on endpoint, symbol case and bot filtering.
+    """
+    d1 = date_compact(start)
+    d2 = date_compact(end)
+
+    attempts = []
+    for symbol in ("^spx", "^SPX"):
+        for interval in ("d", "m"):
+            params = {"s": symbol, "d1": d1, "d2": d2, "i": interval}
+            attempts.append("https://stooq.com/q/d/l/?" + urllib.parse.urlencode(params))
+
+    errors = []
+    for url in attempts:
+        try:
+            raw = fetch_text(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Accept": "text/csv,text/plain,*/*",
+                "Referer": "https://stooq.com/q/d/?s=%5Espx",
+            }, timeout=12)
+            observations = parse_stooq_csv(raw)
+            if observations:
+                return observations
+            errors.append(f"sin CSV legible en {url}; preview={raw[:90].replace(chr(10),' ')}")
+        except Exception as error:
+            errors.append(f"{url}: {error}")
+
+    raise ValueError("Stooq S&P 500 no devolvió observaciones legibles: " + " | ".join(errors[-3:]))
+
+
+def unix_timestamp_utc(date_text: str, add_days: int = 0):
+    text = str(date_text or "")[:10]
+    if re.fullmatch(r"\d{4}-\d{2}$", text):
+        text = text + "-01"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError(f"Fecha inválida para Yahoo Finance: {date_text}")
+    dt = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=add_days)
+    return int(dt.timestamp())
+
+def fetch_sp500_yahoo_history(start: str, end: str):
+    """Daily S&P 500 close from Yahoo Finance chart API (^GSPC)."""
+    period1 = unix_timestamp_utc(start, 0)
+    # Yahoo period2 is exclusive, so include one extra day.
+    period2 = unix_timestamp_utc(end, 1)
+    symbol = "^GSPC"
+    params = {
+        "period1": period1,
+        "period2": period2,
+        "interval": "1d",
+        "events": "history",
+        "includeAdjustedClose": "true",
+    }
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol, safe="") + "?" + urllib.parse.urlencode(params)
+    payload = fetch_json(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://finance.yahoo.com/quote/%5EGSPC/history",
+    })
+
+    chart = payload.get("chart") or {}
+    error = chart.get("error")
+    if error:
+        raise ValueError(f"Yahoo Finance error: {error}")
+
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError("Yahoo Finance no devolvió resultados para ^GSPC")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    closes = quote.get("close") or []
+
+    observations = []
+    for ts, close in zip(timestamps, closes):
+        if close in (None, "", ".", "-"):
+            continue
+        try:
+            date = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+            observations.append({"date": date, "value": float(close)})
+        except Exception:
+            continue
+
+    observations.sort(key=lambda x: x["date"])
+    if not observations:
+        raise ValueError("Yahoo Finance no devolvió cierres legibles para ^GSPC")
+    return observations
+
+def fetch_sp500_history(start: str, end: str, fred_key: str | None = None):
+    """Get S&P 500 history.
+
+    Source priority:
+    1) Yahoo Finance chart API (^GSPC) for long exact S&P 500 history.
+    2) Stooq (^SPX/^spx) as fallback.
+    3) FRED SP500 as fallback when configured and available.
+
+    Returns observations shaped like FRED: [{date: YYYY-MM-DD, value: close}].
+    """
+    errors = []
+
+    try:
+        return fetch_sp500_yahoo_history(start, end)
+    except Exception as yahoo_error:
+        errors.append(f"Yahoo ^GSPC: {yahoo_error}")
+
+    try:
+        return fetch_sp500_stooq_history(start, end)
+    except Exception as stooq_error:
+        errors.append(f"Stooq ^SPX: {stooq_error}")
+
+    if fred_key:
+        try:
+            obs = fred_observations("SP500", fred_key, start, end)
+            if obs:
+                return obs
+            errors.append("FRED SP500: sin observaciones")
+        except Exception as fred_error:
+            errors.append(f"FRED SP500: {fred_error}")
+    else:
+        errors.append("FRED SP500: FRED_API_KEY no configurada")
+
+    raise ValueError("S&P 500 no disponible. " + " | ".join(errors))
 
 def excel_serial_to_date(value):
     try:
@@ -738,6 +896,7 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
     end_year = int(end[:4])
 
     monthly = {}
+    warnings = []
 
     for key, (series_id, _label) in FRED_SERIES.items():
         try:
@@ -784,12 +943,21 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
     except Exception:
         pass
 
+    try:
+        sp500_obs = fetch_sp500_history(start, end, fred_key)
+        by_month = last_observation_per_month(sp500_obs)
+        for date_key, value in by_month.items():
+            monthly.setdefault(date_key, {"date": date_key})
+            monthly[date_key]["sp500"] = round(value, 2)
+    except Exception as error:
+        warnings.append(f"S&P 500 histórico no se pudo cargar: {error}")
+
     rows = [monthly[k] for k in sorted(monthly.keys())]
 
     for row in rows:
         enrich_history_row(row)
 
-    return rows
+    return rows, warnings
 
 def fetch_gdelt_logistics_articles(max_records: int = 25):
     try:
@@ -1364,6 +1532,29 @@ def macro_recession_news():
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
 
+@app.post("/api/sp500-test")
+def sp500_test():
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        start = str(payload.get("start", "2007-11-01"))
+        end = str(payload.get("end", "2010-11-28"))
+        fred_key = os.environ.get("FRED_API_KEY", "").strip()
+        observations = fetch_sp500_history(start, end, fred_key)
+        by_month = last_observation_per_month(observations)
+        rows = [{"date": k, "sp500": round(v, 2)} for k, v in sorted(by_month.items())]
+        return jsonify({
+            "ok": True,
+            "start": start,
+            "end": end,
+            "dailyCount": len(observations),
+            "monthlyCount": len(rows),
+            "first": rows[0] if rows else None,
+            "last": rows[-1] if rows else None,
+            "rows": rows,
+        })
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
+
 @app.post("/api/history")
 def history():
     try:
@@ -1377,7 +1568,7 @@ def history():
         start = str(payload.get("start", "2003-01-01"))
         end = str(payload.get("end", datetime.now().strftime("%Y-%m-%d")))
 
-        rows = build_monthly_history(start, end, fred_key, None, "")
+        rows, warnings = build_monthly_history(start, end, fred_key, None, "")
 
         return jsonify({
             "ok": True,
@@ -1386,6 +1577,8 @@ def history():
             "rows": rows,
             "count": len(rows),
             "frequency": "monthly-last-observation",
+            "warnings": warnings,
+            "sp500Available": any(("sp500" in row and row.get("sp500") not in (None, "", ".", "-")) for row in rows),
         })
 
     except Exception as error:
