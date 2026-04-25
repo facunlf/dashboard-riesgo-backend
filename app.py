@@ -692,7 +692,7 @@ def official_data():
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
 
-@app.post("/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news")
+@app.post("/api/logistics-stress-news")
 def logistics_stress_news():
     try:
         result = assess_logistics_stress_from_news()
@@ -700,7 +700,7 @@ def logistics_stress_news():
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
 
-@app.post("/api/global-pmi-news", "/api/macro-recession-news")
+@app.post("/api/global-pmi-news")
 def global_pmi_news():
     try:
         result = assess_global_pmi_from_news()
