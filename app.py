@@ -3,7 +3,10 @@ import json
 import urllib.parse
 import urllib.request
 import re
-from datetime import datetime
+import io
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -40,6 +43,12 @@ MACRO_RECESSION_QUERY = (
     '"unemployment rising" OR "consumer demand slowdown" OR "global growth forecast cut"'
 )
 
+GSCPI_DATA_URLS = [
+    "https://www.newyorkfed.org/medialibrary/research/interactives/gscpi/downloads/gscpi_data.xlsx",
+    "https://newyorkfed.org/medialibrary/research/interactives/gscpi/downloads/gscpi_data.xlsx",
+]
+
+
 def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers: dict | None = None):
     data = None
     req_headers = headers or {}
@@ -64,6 +73,215 @@ def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers:
         except json.JSONDecodeError as error:
             preview = raw[:160].replace("\n", " ")
             raise ValueError(f"Respuesta no JSON del proveedor: {preview}") from error
+
+def fetch_binary(url: str, headers: dict | None = None):
+    req_headers = headers or {}
+    req_headers.setdefault("User-Agent", "macro-risk-dashboard/1.0")
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read()
+        if not raw:
+            raise ValueError("Respuesta vacía del proveedor")
+        return raw
+
+def excel_serial_to_date(value):
+    try:
+        serial = float(value)
+    except (TypeError, ValueError):
+        return None
+    if serial < 20000 or serial > 60000:
+        return None
+    # Excel incorrectly treats 1900 as leap year; 1899-12-30 matches Excel serial dates.
+    dt = datetime(1899, 12, 30) + timedelta(days=serial)
+    return dt.strftime("%Y-%m-%d")
+
+def parse_date_like(value):
+    if value in (None, "", ".", "-"):
+        return None
+    if isinstance(value, (int, float)):
+        return excel_serial_to_date(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return text + "-01"
+    for fmt in ("%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%b-%y", "%b %Y", "%B %Y", "%Y-%m"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return excel_serial_to_date(text)
+
+def column_index(cell_ref: str):
+    letters = "".join(ch for ch in cell_ref if ch.isalpha()).upper()
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+def parse_xlsx_rows(raw: bytes):
+    rows_by_sheet = []
+    ns = {
+        "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        shared_strings = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root.findall("a:si", ns):
+                parts = [node.text or "" for node in si.findall(".//a:t", ns)]
+                shared_strings.append("".join(parts))
+
+        workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels.findall("rel:Relationship", ns)}
+
+        sheet_paths = []
+        for sheet in workbook.findall(".//a:sheet", ns):
+            rid = sheet.attrib.get("{" + ns["r"] + "}id")
+            target = rel_map.get(rid, "")
+            if not target:
+                continue
+            if not target.startswith("/"):
+                target = "xl/" + target
+            target = target.lstrip("/")
+            if target in zf.namelist():
+                sheet_paths.append(target)
+
+        for path in sheet_paths:
+            root = ET.fromstring(zf.read(path))
+            parsed_rows = []
+            for row in root.findall(".//a:sheetData/a:row", ns):
+                values = {}
+                for cell in row.findall("a:c", ns):
+                    ref = cell.attrib.get("r", "A1")
+                    idx = column_index(ref)
+                    cell_type = cell.attrib.get("t")
+                    value_node = cell.find("a:v", ns)
+                    inline_node = cell.find("a:is/a:t", ns)
+                    raw_value = value_node.text if value_node is not None else inline_node.text if inline_node is not None else ""
+                    if cell_type == "s":
+                        try:
+                            value = shared_strings[int(raw_value)]
+                        except Exception:
+                            value = raw_value
+                    else:
+                        value = raw_value
+                    values[idx] = value
+                if values:
+                    max_idx = max(values)
+                    parsed_rows.append([values.get(i, "") for i in range(max_idx + 1)])
+            rows_by_sheet.append(parsed_rows)
+    return rows_by_sheet
+
+def parse_float_like(value):
+    if value in (None, "", ".", "-"):
+        return None
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+def normalize_provider_date(value):
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}.*", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", text):
+        return text[:10]
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return text
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def fetch_gscpi_nyfed_history(start: str | None = None, end: str | None = None):
+    last_error = None
+    for url in GSCPI_DATA_URLS:
+        try:
+            raw = fetch_binary(url)
+            sheets = parse_xlsx_rows(raw)
+            observations = []
+
+            for rows in sheets:
+                header_idx = None
+                date_col = None
+                value_col = None
+
+                for idx, row in enumerate(rows[:80]):
+                    lowered = [str(x).strip().lower() for x in row]
+                    for c, cell in enumerate(lowered):
+                        if "date" in cell or "month" in cell:
+                            date_col = c
+                        if "gscpi" in cell or "global supply chain pressure" in cell:
+                            value_col = c
+                    if date_col is not None and value_col is not None:
+                        header_idx = idx
+                        break
+
+                if header_idx is not None:
+                    data_rows = rows[header_idx + 1:]
+                else:
+                    data_rows = rows
+
+                for row in data_rows:
+                    if not row:
+                        continue
+
+                    if date_col is not None and value_col is not None and max(date_col, value_col) < len(row):
+                        date_value = row[date_col]
+                        gscpi_value = row[value_col]
+                    else:
+                        parsed = [(i, parse_date_like(v)) for i, v in enumerate(row)]
+                        parsed = [(i, d) for i, d in parsed if d]
+                        if not parsed:
+                            continue
+                        date_i, parsed_date = parsed[0]
+                        numeric_candidates = [parse_float_like(v) for i, v in enumerate(row) if i != date_i]
+                        numeric_candidates = [v for v in numeric_candidates if v is not None and -10 <= v <= 10]
+                        if not numeric_candidates:
+                            continue
+                        date_value = parsed_date
+                        gscpi_value = numeric_candidates[0]
+
+                    parsed_date = parse_date_like(date_value)
+                    numeric = parse_float_like(gscpi_value)
+                    if parsed_date and numeric is not None and -10 <= numeric <= 10:
+                        if start and parsed_date < start:
+                            continue
+                        if end and parsed_date > end:
+                            continue
+                        observations.append({"date": parsed_date, "value": round(numeric, 4)})
+
+            observations.sort(key=lambda x: x["date"])
+            # de-duplicate same date if workbook contains chart/helper sheets
+            deduped = {}
+            for obs in observations:
+                deduped[obs["date"]] = obs
+            observations = list(deduped.values())
+            observations.sort(key=lambda x: x["date"])
+
+            if observations:
+                return observations
+            last_error = ValueError("El archivo oficial de GSCPI no contenía observaciones legibles")
+        except Exception as error:
+            last_error = error
+
+    raise ValueError(f"No se pudo leer GSCPI desde New York Fed: {last_error}")
+
+def fetch_gscpi_latest():
+    observations = fetch_gscpi_nyfed_history()
+    latest = observations[-1]
+    previous = observations[-2] if len(observations) > 1 else latest
+    return {
+        "latest": latest["value"],
+        "previous": previous["value"],
+        "date": latest["date"],
+        "series": "NYFED_GSCPI",
+        "source": "New York Fed GSCPI",
+    }
 
 def fred_observations(series_id: str, api_key: str, start: str | None = None, end: str | None = None):
     params = {
@@ -106,6 +324,32 @@ def fetch_fred_latest(series_id: str, api_key: str):
         "previous": previous["value"],
         "date": latest["date"],
         "series": series_id,
+    }
+
+def fetch_fred_yoy_latest(series_id: str, api_key: str):
+    observations = fred_observations(series_id, api_key)
+    if len(observations) < 13:
+        raise ValueError(f"FRED {series_id}: datos insuficientes para calcular interanual")
+
+    latest = observations[-1]
+    latest_month = latest["date"][5:7]
+    latest_year = int(latest["date"][:4])
+    previous_year_same_month = next(
+        (obs for obs in reversed(observations) if obs["date"][:4] == str(latest_year - 1) and obs["date"][5:7] == latest_month),
+        None,
+    )
+    if not previous_year_same_month:
+        raise ValueError(f"FRED {series_id}: no se encontró el mismo mes del año previo")
+
+    yoy = ((latest["value"] / previous_year_same_month["value"]) - 1) * 100
+    return {
+        "latest": round(yoy, 2),
+        "latestIndex": latest["value"],
+        "previousIndex": previous_year_same_month["value"],
+        "previous": None,
+        "date": latest["date"][:7],
+        "series": series_id,
+        "source": "FRED CPILFESL",
     }
 
 def fetch_fred_pair_spread(series_a: str, series_b: str, api_key: str):
@@ -235,6 +479,238 @@ def last_observation_per_month(observations):
         out[month_key(obs["date"])] = obs["value"]
     return out
 
+
+def clamp(value, minimum=0, maximum=100):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 0
+    return max(minimum, min(maximum, value))
+
+def num(row, key, default=0):
+    try:
+        value = row.get(key, default)
+        if value in (None, "", ".", "-"):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def score_range(value, low, high):
+    if high == low:
+        return 0
+    return clamp(((float(value) - low) / (high - low)) * 100)
+
+def score_inverse(value, healthy, stress):
+    if healthy == stress:
+        return 0
+    return clamp(((healthy - float(value)) / (healthy - stress)) * 100)
+
+def credit_stress_value(row):
+    return score_range(num(row, "creditSpreads", 2.5), 2.5, 6.5)
+
+def vix_stress_value(row):
+    return score_range(num(row, "vix", 12), 12, 35)
+
+def curve_stress_value(row):
+    return score_inverse(num(row, "yieldCurve10y2y", 0.75), 0.75, -1.00)
+
+def unemployment_stress_value(row):
+    return score_range(num(row, "unemployment", 3.5), 3.5, 6.0)
+
+def pmi_stress_value(row):
+    return score_inverse(num(row, "globalPMI", 52), 52, 45)
+
+def historical_shipping_stress(row):
+    """
+    Proxy histórico calculado con datos oficiales disponibles.
+    No intenta reconstruir titulares antiguos mes a mes; usa GSCPI, Brent, VIX y USD
+    para que el histórico sea comparable sin cientos de llamadas a GDELT.
+    """
+    gscpi_component = score_range(num(row, "gscpi", 0), -1.0, 2.0)
+    brent_component = score_range(num(row, "brent", 80), 70, 120)
+    vix_component = vix_stress_value(row)
+    usd_component = score_range(num(row, "usdStrength", 110), 105, 130)
+
+    return round(
+        gscpi_component * 0.55
+        + brent_component * 0.25
+        + vix_component * 0.10
+        + usd_component * 0.10
+    )
+
+def supply_stress_value(row):
+    brent = num(row, "brent", 80)
+    gscpi = num(row, "gscpi", 0)
+    logistics = num(row, "shippingStress", historical_shipping_stress(row))
+
+    brent_score = 20 if brent <= 80 else 50 if brent <= 100 else 80
+    gscpi_score = 20 if gscpi <= 0 else 50 if gscpi <= 1 else 80
+    logistics_score = clamp(logistics)
+
+    return round(brent_score * 0.4 + gscpi_score * 0.3 + logistics_score * 0.3)
+
+def financial_stress_value(row):
+    return round(
+        credit_stress_value(row) * 0.45
+        + vix_stress_value(row) * 0.30
+        + curve_stress_value(row) * 0.25,
+        1,
+    )
+
+def global_pmi_proxy(row):
+    """
+    Proxy calculado para meses donde no hay serie oficial de PMI global disponible.
+    Convierte estrés financiero/oferta en una lectura tipo PMI para comparar ciclos.
+    """
+    financial = financial_stress_value(row)
+    supply = supply_stress_value(row)
+    unemployment = unemployment_stress_value(row)
+    value = 52.5 - financial * 0.035 - supply * 0.015 - unemployment * 0.010
+    return round(clamp(value, 45, 55), 1)
+
+def recession_risk_value(row):
+    if row.get("globalPMI") in (None, "", ".", "-"):
+        row["globalPMI"] = global_pmi_proxy(row)
+
+    macro_news_proxy = clamp(num(row, "macroNewsRecession", 0) or (num(row, "supplyStress", supply_stress_value(row)) * 0.6 + num(row, "shippingStress", historical_shipping_stress(row)) * 0.4))
+
+    return round(
+        curve_stress_value(row) * 0.25
+        + unemployment_stress_value(row) * 0.20
+        + credit_stress_value(row) * 0.20
+        + vix_stress_value(row) * 0.10
+        + pmi_stress_value(row) * 0.15
+        + macro_news_proxy * 0.10
+    )
+
+def status_for_value(key, value):
+    v = float(value)
+    if key == "globalPMI":
+        return "green" if v >= 52 else "yellow" if v >= 50 else "red"
+    if key == "yieldCurve10y2y":
+        return "green" if v >= 0.25 else "yellow" if v >= -0.50 else "red"
+    if key == "supplyStress":
+        return "green" if v <= 30 else "yellow" if v <= 60 else "red"
+    if key == "gscpi":
+        return "green" if v <= 0 else "yellow" if v <= 1 else "red"
+    if key == "brent":
+        return "green" if v <= 90 else "yellow" if v <= 100 else "red"
+    if key == "coreInflation":
+        return "green" if v <= 2.5 else "yellow" if v <= 3.2 else "red"
+    if key == "realYield10y":
+        return "green" if v <= 1.0 else "yellow" if v <= 1.75 else "red"
+    if key == "creditSpreads":
+        return "green" if v <= 4.0 else "yellow" if v <= 5.5 else "red"
+    if key == "vix":
+        return "green" if v <= 20 else "yellow" if v <= 30 else "red"
+    if key == "tenYearBreakeven":
+        return "green" if v <= 2.4 else "yellow" if v <= 2.8 else "red"
+    if key == "recessionRisk":
+        return "green" if v <= 20 else "yellow" if v <= 30 else "red"
+    if key == "shippingStress":
+        return "green" if v <= 35 else "yellow" if v <= 60 else "red"
+    if key == "usdStrength":
+        return "green" if v <= 115 else "yellow" if v <= 125 else "red"
+    if key == "unemployment":
+        return "green" if v <= 4.5 else "yellow" if v <= 5.5 else "red"
+    return "yellow"
+
+INDICATOR_WEIGHTS = {
+    "supplyStress": 1.5,
+    "brent": 1.4,
+    "gscpi": 1.15,
+    "coreInflation": 1.15,
+    "realYield10y": 1.15,
+    "globalPMI": 1.25,
+    "creditSpreads": 1.6,
+    "vix": 1.1,
+    "yieldCurve10y2y": 1.0,
+    "tenYearBreakeven": 0.9,
+    "recessionRisk": 1.0,
+    "shippingStress": 1.2,
+    "usdStrength": 0.8,
+    "unemployment": 0.9,
+}
+
+def risk_score_value(row):
+    score = 0
+    maximum = 0
+    for key, weight in INDICATOR_WEIGHTS.items():
+        if key not in row:
+            continue
+        status = status_for_value(key, num(row, key, 0))
+        score += (0 if status == "green" else 1 if status == "yellow" else 2) * weight
+        maximum += 2 * weight
+    return round((score / maximum) * 100, 1) if maximum else 0
+
+def scenario_estimates(row):
+    supply = num(row, "supplyStress", supply_stress_value(row))
+    shipping = num(row, "shippingStress", historical_shipping_stress(row))
+    brent_score = score_range(num(row, "brent", 80), 80, 120)
+    inflation_score = score_range(num(row, "coreInflation", 2), 2.0, 5.0)
+    pmi_weakness = pmi_stress_value(row)
+    real_yield_score = score_range(num(row, "realYield10y", 1), 0.5, 2.5)
+    breakeven_score = score_range(num(row, "tenYearBreakeven", 2.2), 2.0, 3.2)
+    financial = num(row, "financialStress", financial_stress_value(row))
+    recession = num(row, "recessionRisk", recession_risk_value(row))
+
+    raw = {
+        "Shock energético": supply * 0.55 + brent_score * 0.25 + shipping * 0.20,
+        "Contagio macro / estanflación": inflation_score * 0.30 + pmi_weakness * 0.25 + real_yield_score * 0.15 + supply * 0.20 + breakeven_score * 0.10,
+        "Escalada sistémica": financial * 0.40 + recession * 0.35 + credit_stress_value(row) * 0.15 + vix_stress_value(row) * 0.10,
+    }
+
+    total = sum(raw.values()) or 1
+    probs = {name: round(value / total * 100) for name, value in raw.items()}
+    diff = 100 - sum(probs.values())
+    largest = max(probs, key=probs.get)
+    probs[largest] += diff
+
+    return [
+        {
+            "name": "Shock energético",
+            "probability": probs["Shock energético"],
+            "marketImpact": -round(5 + raw["Shock energético"] * 0.14),
+            "description": "Petróleo, GSCPI y logística dominan el riesgo.",
+        },
+        {
+            "name": "Contagio macro / estanflación",
+            "probability": probs["Contagio macro / estanflación"],
+            "marketImpact": -round(8 + raw["Contagio macro / estanflación"] * 0.20),
+            "description": "Inflación persistente, PMI débil y tipos reales restrictivos.",
+        },
+        {
+            "name": "Escalada sistémica",
+            "probability": probs["Escalada sistémica"],
+            "marketImpact": -round(12 + raw["Escalada sistémica"] * 0.33),
+            "description": "Financial Stress, crédito, VIX y recesión validan un escenario más severo.",
+        },
+    ]
+
+def weighted_drawdown_value(scenarios):
+    return round(sum(abs(float(s["marketImpact"])) * float(s["probability"]) / 100 for s in scenarios), 1)
+
+def enrich_history_row(row):
+    if "shippingStress" not in row or row.get("shippingStress") in (None, "", ".", "-"):
+        row["shippingStress"] = historical_shipping_stress(row)
+
+    if "globalPMI" not in row or row.get("globalPMI") in (None, "", ".", "-"):
+        row["globalPMI"] = global_pmi_proxy(row)
+
+    row["supplyStress"] = supply_stress_value(row)
+    row["financialStress"] = financial_stress_value(row)
+    row["recessionRisk"] = recession_risk_value(row)
+    row["riskScore"] = risk_score_value(row)
+
+    scenarios = scenario_estimates(row)
+    row["drawdownExpected"] = weighted_drawdown_value(scenarios)
+    row["scenarioShockProbability"] = scenarios[0]["probability"]
+    row["scenarioStagflationProbability"] = scenarios[1]["probability"]
+    row["scenarioSystemicProbability"] = scenarios[2]["probability"]
+
+    return row
+
 def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | None, bls_series: str):
     start_year = int(start[:4])
     end_year = int(end[:4])
@@ -249,6 +725,22 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
             for date_key, value in by_month.items():
                 monthly.setdefault(date_key, {"date": date_key})
                 monthly[date_key][key] = round(value, 4)
+        except Exception:
+            pass
+
+    try:
+        gscpi_obs = fetch_gscpi_nyfed_history(start, end)
+        by_month = last_observation_per_month(gscpi_obs)
+        for date_key, value in by_month.items():
+            monthly.setdefault(date_key, {"date": date_key})
+            monthly[date_key]["gscpi"] = round(value, 4)
+    except Exception:
+        try:
+            gscpi_obs = fred_observations("GSCPI", fred_key, start, end)
+            by_month = last_observation_per_month(gscpi_obs)
+            for date_key, value in by_month.items():
+                monthly.setdefault(date_key, {"date": date_key})
+                monthly[date_key]["gscpi"] = round(value, 4)
         except Exception:
             pass
 
@@ -273,15 +765,7 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
     rows = [monthly[k] for k in sorted(monthly.keys())]
 
     for row in rows:
-        brent = float(row.get("brent", 0) or 0)
-        gscpi = float(row.get("gscpi", 0) or 0)
-        logistics = float(row.get("shippingStress", 50) or 50)
-
-        brent_score = 20 if brent <= 80 else 50 if brent <= 100 else 80
-        gscpi_score = 20 if gscpi <= 0 else 50 if gscpi <= 1 else 80
-        logistics_score = max(0, min(100, logistics))
-
-        row["supplyStress"] = round(brent_score * 0.4 + gscpi_score * 0.3 + logistics_score * 0.3)
+        enrich_history_row(row)
 
     return rows
 
@@ -477,7 +961,7 @@ def assess_global_pmi_from_news():
     return {
         "latest": chosen["value"],
         "previous": None,
-        "date": chosen.get("seendate", "")[:8] or datetime.utcnow().strftime("%Y-%m-%d"),
+        "date": normalize_provider_date(chosen.get("seendate", "")),
         "source": "GDELT PMI news parser",
         "confidence": 0.55,
         "summary": f"PMI global extraído desde noticia/titular: {chosen['title']}",
@@ -575,7 +1059,7 @@ def assess_macro_news_recession_score():
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO Fixed Logistics + PMI + Recession del dashboard funcionando",
+        "message": "Backend PRO Fixed Logistics + PMI + Recession v3 del dashboard funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -588,7 +1072,7 @@ def health():
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
             "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
-            "version": "pro-free-logistics-pmi-recession-fix-v1",
+            "version": "pro-free-logistics-pmi-recession-history-v3",
         }
     })
 
@@ -621,7 +1105,7 @@ def official_data():
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
                 "blsSeries": bls_series,
-                "version": "pro-free-logistics-pmi-recession-fix-v1",
+                "version": "pro-free-logistics-pmi-recession-history-v3",
             }
         }
 
@@ -645,11 +1129,35 @@ def official_data():
             out["messages"].append("FRED_API_KEY no está configurada en Render")
 
         try:
+            gscpi = fetch_gscpi_latest()
+            out["updates"]["gscpi"] = gscpi
+            out["messages"].append(f"Global Supply Chain Pressure Index actualizado ({gscpi['date']})")
+        except Exception:
+            if fred_key:
+                try:
+                    gscpi = fetch_fred_latest("GSCPI", fred_key)
+                    gscpi["source"] = "FRED GSCPI"
+                    out["updates"]["gscpi"] = gscpi
+                    out["messages"].append(f"Global Supply Chain Pressure Index actualizado ({gscpi['date']})")
+                except Exception:
+                    out["messages"].append("Global Supply Chain Pressure Index no se actualizó; se conserva el último valor cargado")
+            else:
+                out["messages"].append("Global Supply Chain Pressure Index no se actualizó; se conserva el último valor cargado")
+
+        try:
             core = fetch_bls_core_yoy(bls_series, bls_key or None)
             out["updates"]["coreInflation"] = core
             out["messages"].append(f"Inflación core interanual actualizada ({core['date']})")
-        except Exception as error:
-            out["messages"].append(f"Error BLS: {error}")
+        except Exception:
+            if fred_key:
+                try:
+                    core = fetch_fred_yoy_latest("CPILFESL", fred_key)
+                    out["updates"]["coreInflation"] = core
+                    out["messages"].append(f"Inflación core interanual actualizada con FRED ({core['date']})")
+                except Exception:
+                    out["messages"].append("Inflación core no se actualizó; se conserva el último valor cargado")
+            else:
+                out["messages"].append("Inflación core no se actualizó; se conserva el último valor cargado")
 
         try:
             logistics = assess_logistics_stress_from_news()
@@ -659,8 +1167,8 @@ def official_data():
                 f"Estrés logístico estimado con noticias: {logistics['latest']}/100 "
                 f"({logistics['level']}, confianza {round(logistics['confidence'] * 100)}%)"
             )
-        except Exception as error:
-            out["messages"].append(f"Error estrés logístico con noticias: {error}")
+        except Exception:
+            out["messages"].append("Estrés logístico por noticias no se actualizó; se conserva el último valor cargado")
 
         try:
             pmi = assess_global_pmi_from_news()
