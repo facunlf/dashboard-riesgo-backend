@@ -1,4 +1,4 @@
-Backend PRO listo para Render.
+Backend PRO + Supply Stress listo para Render.
 
 ARCHIVOS:
 - app.py
@@ -27,4 +27,8 @@ INDICADORES AUTOMÁTICOS:
 - 10Y breakeven inflation: T10YIE
 - 10Y real yield: DFII10
 - Unemployment: UNRATE
+- GSCPI / Global Supply Chain Pressure Index: GSCPI
 - Core CPI YoY: BLS CUUR0000SA0L1E
+
+SUPPLY STRESS:
+El frontend lo calcula automáticamente combinando Brent + GSCPI + Estrés logístico.

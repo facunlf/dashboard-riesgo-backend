@@ -55,12 +55,16 @@ def fetch_fred_latest(series_id: str, api_key: str, limit: int = 2):
 def fetch_fred_pair_spread(series_a: str, series_b: str, api_key: str):
     a = fetch_fred_latest(series_a, api_key)
     b = fetch_fred_latest(series_b, api_key)
+
     return {
         "latest": round(a["latest"] - b["latest"], 3),
         "previous": None,
         "date": max(a["date"], b["date"]),
         "series": f"{series_a}-{series_b}",
-        "parts": {series_a: a["latest"], series_b: b["latest"]},
+        "parts": {
+            series_a: a["latest"],
+            series_b: b["latest"],
+        },
     }
 
 def fetch_bls_core_yoy(series_id: str, registration_key: str | None = None):
@@ -126,7 +130,7 @@ def fetch_bls_core_yoy(series_id: str, registration_key: str | None = None):
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend pro del dashboard funcionando",
+        "message": "Backend PRO Supply del dashboard funcionando",
         "endpoints": ["/health", "/api/official-data"],
     })
 
@@ -139,7 +143,7 @@ def health():
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
             "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
-            "version": "pro-env-keys-v1",
+            "version": "pro-supply-env-keys-v1",
         }
     })
 
@@ -172,7 +176,7 @@ def official_data():
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
                 "blsSeries": bls_series,
-                "version": "pro-env-keys-v1",
+                "version": "pro-supply-env-keys-v1",
             }
         }
 
@@ -187,6 +191,7 @@ def official_data():
                 "tenYearBreakeven": ("T10YIE", "Inflation breakeven 10Y"),
                 "realYield10y": ("DFII10", "Real yield 10Y"),
                 "unemployment": ("UNRATE", "Unemployment"),
+                "gscpi": ("GSCPI", "Global Supply Chain Pressure Index"),
             }
 
             for key, (series, label) in fred_jobs.items():
