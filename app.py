@@ -22,15 +22,22 @@ FRED_SERIES = {
     "gscpi": ("GSCPI", "Global Supply Chain Pressure Index"),
 }
 
-def fetch_json(url: str, method: str = "GET", body: dict | None = None):
+LOGISTICS_QUERY = (
+    '("shipping disruption" OR "maritime insurance" OR "war risk insurance" OR '
+    '"Strait of Hormuz" OR "Red Sea shipping" OR "Suez Canal" OR "port congestion" OR '
+    '"tanker attack" OR "container shipping" OR "freight rates" OR "shipping route diversion" OR '
+    '"vessel attacks" OR "maritime security")'
+)
+
+def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers: dict | None = None):
     data = None
-    headers = {}
+    req_headers = headers or {}
 
     if body is not None:
         data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        req_headers["Content-Type"] = "application/json"
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
 
     with urllib.request.urlopen(req, timeout=45) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -160,7 +167,6 @@ def fetch_bls_core_yoy(series_id: str, registration_key: str | None = None):
     }
 
 def fetch_bls_core_yoy_history(series_id: str, start_year: int, end_year: int, registration_key: str | None = None):
-    # Pedimos un año extra hacia atrás para poder calcular YoY desde el primer año seleccionado.
     rows = fetch_bls_series(series_id, max(1990, start_year - 1), end_year, registration_key)
     output = []
 
@@ -211,11 +217,9 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
             for date_key, value in by_month.items():
                 monthly.setdefault(date_key, {"date": date_key})
                 monthly[date_key][key] = round(value, 4)
-        except Exception as error:
-            # No frenamos todo por una serie.
+        except Exception:
             pass
 
-    # Curva 10Y-2Y
     try:
         dgs10 = last_observation_per_month(fred_observations("DGS10", fred_key, start, end))
         dgs2 = last_observation_per_month(fred_observations("DGS2", fred_key, start, end))
@@ -225,7 +229,6 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
     except Exception:
         pass
 
-    # Core CPI YoY desde BLS
     try:
         core_history = fetch_bls_core_yoy_history(bls_series, start_year, end_year, bls_key)
         for obs in core_history:
@@ -237,7 +240,6 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
 
     rows = [monthly[k] for k in sorted(monthly.keys())]
 
-    # Supply Stress calculado a nivel backend para históricos.
     for row in rows:
         brent = float(row.get("brent", 0) or 0)
         gscpi = float(row.get("gscpi", 0) or 0)
@@ -251,12 +253,111 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
 
     return rows
 
+def fetch_gdelt_logistics_articles(max_records: int = 25):
+    params = {
+        "query": LOGISTICS_QUERY,
+        "mode": "artlist",
+        "format": "json",
+        "maxrecords": max_records,
+        "sort": "hybridrel",
+        "timespan": "7d",
+    }
+
+    url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+    payload = fetch_json(url)
+
+    articles = []
+    for item in payload.get("articles", [])[:max_records]:
+        articles.append({
+            "title": item.get("title", ""),
+            "source": item.get("sourceCountry", "") or item.get("domain", ""),
+            "domain": item.get("domain", ""),
+            "url": item.get("url", ""),
+            "seendate": item.get("seendate", ""),
+            "language": item.get("language", ""),
+        })
+
+    return articles
+
+def heuristic_logistics_score(articles):
+    text = " ".join((a.get("title") or "").lower() for a in articles)
+
+    severe_terms = [
+        "closed", "closure", "blocked", "blockade", "suspended", "halted",
+        "attack", "attacks", "missile", "tanker attack", "strait of hormuz",
+        "red sea", "war risk", "rerouting", "route diversion",
+    ]
+    moderate_terms = [
+        "delay", "delays", "congestion", "insurance", "freight rates",
+        "shipping costs", "port congestion", "suez", "maritime security",
+    ]
+
+    severe_hits = sum(text.count(term) for term in severe_terms)
+    moderate_hits = sum(text.count(term) for term in moderate_terms)
+
+    score = 25 + severe_hits * 10 + moderate_hits * 5 + min(len(articles), 25) * 0.8
+    score = max(0, min(100, round(score)))
+
+    if score >= 80:
+        level = "severo"
+    elif score >= 60:
+        level = "alto"
+    elif score >= 40:
+        level = "moderado"
+    elif score >= 20:
+        level = "leve"
+    else:
+        level = "bajo"
+
+    drivers = []
+    for term in severe_terms + moderate_terms:
+        if term in text and len(drivers) < 8:
+            drivers.append(term)
+
+    return {
+        "score": score,
+        "level": level,
+        "confidence": 0.45,
+        "summary": "Estimación heurística basada en titulares recientes de logística marítima, seguros, rutas y disrupciones.",
+        "drivers": drivers or ["sin drivers críticos detectados"],
+    }
+
+def ai_logistics_score(articles):
+    # Versión gratuita: sin OpenAI API.
+    # Se mantiene esta función como stub para conservar estructura.
+    return None
+
+def assess_logistics_stress_from_news():
+    articles = fetch_gdelt_logistics_articles(25)
+    heuristic = heuristic_logistics_score(articles)
+
+    ai_result = None
+    try:
+        ai_result = ai_logistics_score(articles)
+    except Exception as error:
+        ai_result = None
+
+    result = ai_result or heuristic
+
+    return {
+        "latest": result["score"],
+        "previous": None,
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "source": "GDELT heuristic",
+        "level": result["level"],
+        "confidence": result["confidence"],
+        "summary": result["summary"],
+        "drivers": result["drivers"],
+        "articleCount": len(articles),
+        "sampleArticles": articles[:6],
+    }
+
 @app.get("/")
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO History del dashboard funcionando",
-        "endpoints": ["/health", "/api/official-data", "/api/history"],
+        "message": "Backend PRO Free Logistics del dashboard funcionando",
+        "endpoints": ["/health", "/api/official-data", "/api/history", "/api/logistics-stress-news"],
     })
 
 @app.get("/health")
@@ -268,7 +369,7 @@ def health():
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
             "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
-            "version": "pro-history-v1",
+            "version": "pro-free-logistics-v1",
         }
     })
 
@@ -301,7 +402,7 @@ def official_data():
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
                 "blsSeries": bls_series,
-                "version": "pro-history-v1",
+                "version": "pro-free-logistics-v1",
             }
         }
 
@@ -331,8 +432,27 @@ def official_data():
         except Exception as error:
             out["messages"].append(f"Error BLS: {error}")
 
+        try:
+            logistics = assess_logistics_stress_from_news()
+            out["updates"]["shippingStress"] = logistics
+            out["logisticsStressNews"] = logistics
+            out["messages"].append(
+                f"Estrés logístico estimado con noticias: {logistics['latest']}/100 "
+                f"({logistics['level']}, confianza {round(logistics['confidence'] * 100)}%)"
+            )
+        except Exception as error:
+            out["messages"].append(f"Error estrés logístico con noticias: {error}")
+
         return jsonify(out)
 
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
+
+@app.post("/api/logistics-stress-news")
+def logistics_stress_news():
+    try:
+        result = assess_logistics_stress_from_news()
+        return jsonify({"ok": True, "result": result})
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
 

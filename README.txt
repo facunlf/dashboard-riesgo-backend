@@ -1,8 +1,8 @@
-Backend PRO + Históricos listo para Render.
+Backend PRO + Estrés Logístico gratuito listo para Render.
 
-ARCHIVOS:
-- app.py
-- requirements.txt
+NO requiere tarjeta de OpenAI.
+NO requiere OPENAI_API_KEY.
+NO requiere LOGISTICS_CACHE_HOURS.
 
 CONFIGURACIÓN EN RENDER:
 Build Command:
@@ -16,10 +16,9 @@ FRED_API_KEY = tu clave de FRED
 BLS_API_KEY = tu clave de BLS, opcional
 BLS_SERIES = CUUR0000SA0L1E
 
-ENDPOINTS:
-GET /health
-POST /api/official-data
-POST /api/history
-
-NUEVO:
-POST /api/history permite descargar históricos mensuales desde 2003 o el rango que indiques.
+QUÉ HACE:
+- Actualiza indicadores FRED/BLS.
+- Consulta titulares recientes vía GDELT.
+- Calcula Estrés logístico con una heurística gratuita basada en palabras clave.
+- No usa OpenAI API.
+- No tiene coste por IA.
