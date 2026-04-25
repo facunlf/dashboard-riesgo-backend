@@ -8,6 +8,7 @@ import io
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -959,6 +960,19 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
 
     return rows, warnings
 
+
+# -------------------------------------------------------------------------------------------
+# LOGISTICS STRESS - MULTI-SOURCE NEWS ENGINE
+# -------------------------------------------------------------------------------------------
+# Optional environment variables for Render:
+#   NEWSAPI_KEY
+#   GUARDIAN_API_KEY
+#   NYT_API_KEY
+#
+# If a key is missing, that provider is skipped automatically. GDELT and RSS do not need keys.
+# This section avoids a fixed override: crisis terms push the score up, normalization terms push it
+# down only when they describe operational normalization, not just political statements.
+
 LOGISTICS_QUERIES = [
     {
         "name": "hormuz_crisis",
@@ -967,7 +981,8 @@ LOGISTICS_QUERIES = [
             '(shipping OR tanker OR vessel OR ship OR maritime OR oil) '
             '(closed OR closure OR blocked OR blockade OR attack OR attacks OR seized OR captured '
             'OR fired OR missile OR drone OR mine OR mines OR suspended OR halted OR rerouting '
-            'OR "war risk" OR "not allowed" OR "traffic halted" OR "shipping suspended")'
+            'OR "war risk" OR "not allowed" OR "traffic halted" OR "shipping suspended" '
+            'OR "tankers stuck" OR "ships stuck" OR "mariners stranded")'
         ),
     },
     {
@@ -1005,24 +1020,73 @@ LOGISTICS_QUERIES = [
     },
 ]
 
+LOGISTICS_SEARCH_PHRASES = [
+    ("hormuz_crisis", '"Strait of Hormuz" shipping attack tanker seized blocked suspended'),
+    ("hormuz_traffic", '"Strait of Hormuz" traffic halted ships stuck tankers stuck mariners stranded'),
+    ("hormuz_normalization", '"Strait of Hormuz" shipping resumes traffic resumes reopened blockade lifted'),
+    ("red_sea_crisis", '"Red Sea" shipping attack missile drone rerouting suspended war risk'),
+    ("suez_shipping", '"Suez Canal" shipping rerouting freight rates delays congestion'),
+    ("freight_insurance", '"war risk insurance" maritime shipping freight rates disruption'),
+    ("carrier_routes", 'Maersk Hapag-Lloyd MSC CMA CGM shipping route suspended resumed Hormuz Red Sea'),
+    ("ukmto_incidents", 'UKMTO warning incident vessel attack Red Sea Gulf of Aden Strait of Hormuz'),
+]
+
+RSS_LOGISTICS_FEEDS = [
+    ("google_news_hormuz", "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": '"Strait of Hormuz" shipping attack tanker seized blocked suspended when:14d',
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })),
+    ("google_news_hormuz_normalization", "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": '"Strait of Hormuz" shipping resumes traffic resumes reopened blockade lifted when:14d',
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })),
+    ("google_news_red_sea", "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": '"Red Sea" shipping attack rerouting suspended war risk when:14d',
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })),
+    ("google_news_ukmto", "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": 'UKMTO warning vessel attack incident when:14d',
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })),
+    ("google_news_freight", "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": '"war risk insurance" shipping "freight rates" maritime disruption when:14d',
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })),
+]
 
 TRUSTED_LOGISTICS_DOMAINS = {
-    "reuters.com": 1.35,
-    "apnews.com": 1.25,
-    "bloomberg.com": 1.25,
-    "ft.com": 1.25,
-    "wsj.com": 1.20,
-    "lloydslist.com": 1.25,
-    "tradewindsnews.com": 1.20,
-    "maritime-executive.com": 1.15,
-    "gcaptain.com": 1.15,
-    "splash247.com": 1.10,
-    "aljazeera.com": 1.10,
-    "abc.net.au": 1.10,
+    "reuters.com": 1.45,
+    "apnews.com": 1.30,
+    "bloomberg.com": 1.30,
+    "ft.com": 1.30,
+    "wsj.com": 1.25,
+    "lloydslist.com": 1.35,
+    "tradewindsnews.com": 1.25,
+    "maritime-executive.com": 1.20,
+    "gcaptain.com": 1.20,
+    "splash247.com": 1.15,
+    "ukmto.org": 1.35,
+    "imo.org": 1.20,
+    "portwatch.imf.org": 1.25,
+    "aljazeera.com": 1.15,
+    "abc.net.au": 1.15,
     "bbc.com": 1.10,
     "cnn.com": 1.05,
+    "theguardian.com": 1.10,
+    "nytimes.com": 1.10,
+    "newsapi.org": 1.00,
+    "news.google.com": 0.95,
 }
-
 
 CRISIS_TERMS = {
     # Cierre / bloqueo
@@ -1031,10 +1095,16 @@ CRISIS_TERMS = {
     "blocked": 18,
     "blockade": 20,
     "not allowed": 18,
-    "traffic halted": 18,
-    "shipping suspended": 18,
-    "effective standstill": 20,
-    "standstill": 16,
+    "traffic halted": 20,
+    "transit halted": 20,
+    "shipping suspended": 20,
+    "route suspended": 18,
+    "effective standstill": 22,
+    "standstill": 18,
+    "traffic collapse": 22,
+    "traffic collapsed": 22,
+    "traffic down": 16,
+    "traffic reduced": 15,
 
     # Ataques / capturas
     "attack": 14,
@@ -1045,11 +1115,23 @@ CRISIS_TERMS = {
     "drone": 12,
     "mine": 16,
     "mines": 16,
-    "seized": 18,
-    "captured": 18,
+    "seized": 20,
+    "captured": 20,
     "storming": 14,
     "gunboat": 14,
     "fast boat": 12,
+
+    # Barcos/paralización operativa
+    "ships stuck": 18,
+    "tankers stuck": 18,
+    "vessels stuck": 18,
+    "mariners stranded": 18,
+    "seafarers stranded": 18,
+    "crew stranded": 14,
+    "carriers suspend": 18,
+    "suspend route": 18,
+    "avoid the route": 14,
+    "avoiding the route": 14,
 
     # Suspensión / desvío de rutas
     "suspended": 14,
@@ -1057,41 +1139,83 @@ CRISIS_TERMS = {
     "rerouting": 12,
     "rerouted": 12,
     "route diversion": 12,
-    "avoid": 10,
-    "avoiding": 10,
+    "diverted": 10,
+    "avoid": 8,
+    "avoiding": 8,
 
     # Costes / seguros
     "war risk": 12,
-    "insurance": 8,
+    "war-risk": 12,
+    "insurance": 7,
     "freight rates": 8,
     "shipping costs": 8,
     "port congestion": 7,
+    "premium": 5,
 }
-
 
 RELIEF_TERMS = {
+    # Solo deben bajar de verdad si implican normalización operativa.
     "reopened": 18,
     "re-opened": 18,
-    "fully open": 18,
-    "shipping resumes": 16,
-    "traffic resumes": 16,
-    "normal traffic": 18,
+    "fully open": 20,
+    "shipping resumes": 18,
+    "shipping resumed": 18,
+    "traffic resumes": 18,
+    "traffic resumed": 18,
+    "normal traffic": 20,
+    "traffic normal": 20,
     "normalizing": 14,
-    "normalized": 14,
-    "agreement": 12,
-    "ceasefire": 10,
-    "deal": 10,
-    "blockade lifted": 18,
-    "routes restored": 18,
+    "normalized": 16,
+    "carriers resume": 18,
+    "tankers resume": 18,
+    "vessels resume": 18,
+    "blockade lifted": 20,
+    "routes restored": 20,
     "insurance rates fall": 14,
+    "insurance premiums fall": 14,
     "freight rates fall": 12,
+    "backlog cleared": 12,
+
+    # Señales políticas: pesan menos y no bastan solas para bajar mucho.
+    "agreement": 6,
+    "ceasefire": 5,
+    "deal": 5,
 }
 
+POLITICAL_RELIEF_ONLY_TERMS = {"agreement", "ceasefire", "deal"}
 
-def parse_gdelt_seen_date(value: str):
+def provider_key(value: str):
+    return str(value or "").strip().lower().replace(" ", "_")
+
+def article_domain_from_url(url: str):
+    try:
+        domain = urllib.parse.urlparse(str(url or "")).netloc.lower()
+        return domain.replace("www.", "")
+    except Exception:
+        return ""
+
+def normalize_article(article: dict):
+    url = article.get("url") or article.get("link") or ""
+    domain = article.get("domain") or article_domain_from_url(url)
+    return {
+        "title": article.get("title", "") or "",
+        "description": article.get("description", "") or article.get("summary", "") or "",
+        "source": article.get("source", "") or domain,
+        "domain": domain,
+        "url": url,
+        "seendate": article.get("seendate", "") or article.get("publishedAt", "") or article.get("pubDate", ""),
+        "language": article.get("language", "") or "",
+        "queryName": article.get("queryName", "") or "",
+        "provider": article.get("provider", "") or "unknown",
+    }
+
+def parse_article_date(value: str):
     text = str(value or "").strip()
 
-    # GDELT suele devolver seendate tipo 20260423123000
+    if not text:
+        return None
+
+    # GDELT suele devolver seendate tipo 20260423123000.
     if re.fullmatch(r"\d{14}", text):
         try:
             return datetime.strptime(text[:8], "%Y%m%d")
@@ -1108,34 +1232,64 @@ def parse_gdelt_seen_date(value: str):
         try:
             return datetime.strptime(text[:10], "%Y-%m-%d")
         except ValueError:
-            return None
+            pass
 
-    return None
+    # ISO con hora.
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except Exception:
+        pass
 
+    # RSS pubDate.
+    try:
+        parsed = parsedate_to_datetime(text)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return None
+
+def parse_gdelt_seen_date(value: str):
+    return parse_article_date(value)
 
 def recency_weight(seendate: str):
-    seen = parse_gdelt_seen_date(seendate)
+    seen = parse_article_date(seendate)
     if not seen:
         return 0.70
 
     age_days = max(0, (datetime.utcnow() - seen).days)
 
     if age_days <= 1:
-        return 1.25
+        return 1.30
     if age_days <= 3:
-        return 1.10
+        return 1.15
     if age_days <= 7:
-        return 0.90
+        return 0.95
     if age_days <= 14:
-        return 0.65
+        return 0.70
 
     return 0.45
-
 
 def source_weight(domain: str):
     domain = str(domain or "").lower().replace("www.", "")
     return TRUSTED_LOGISTICS_DOMAINS.get(domain, 1.0)
 
+def provider_weight(provider: str):
+    provider = provider_key(provider)
+    weights = {
+        "gdelt": 0.95,
+        "newsapi": 1.10,
+        "guardian": 1.00,
+        "nyt": 1.00,
+        "rss": 0.95,
+        "ukmto_rss": 1.10,
+        "market_proxy": 0.70,
+    }
+    return weights.get(provider, 1.0)
 
 def term_score(text: str, terms: dict):
     total = 0
@@ -1148,6 +1302,11 @@ def term_score(text: str, terms: dict):
 
     return total, hits
 
+def days_ago_iso(days: int = 14):
+    return (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+def days_ago_compact(days: int = 14):
+    return (datetime.utcnow() - timedelta(days=days)).strftime("%Y%m%d")
 
 def fetch_gdelt_articles_for_query(query: str, query_name: str, max_records: int = 30, timespan: str = "14d"):
     params = {
@@ -1165,7 +1324,7 @@ def fetch_gdelt_articles_for_query(query: str, query_name: str, max_records: int
     articles = []
 
     for item in payload.get("articles", [])[:max_records]:
-        articles.append({
+        articles.append(normalize_article({
             "title": item.get("title", ""),
             "source": item.get("sourceCountry", "") or item.get("domain", ""),
             "domain": item.get("domain", ""),
@@ -1173,10 +1332,10 @@ def fetch_gdelt_articles_for_query(query: str, query_name: str, max_records: int
             "seendate": item.get("seendate", ""),
             "language": item.get("language", ""),
             "queryName": query_name,
-        })
+            "provider": "gdelt",
+        }))
 
     return articles
-
 
 def fetch_gdelt_logistics_articles(max_records: int = 90):
     all_articles = []
@@ -1203,31 +1362,296 @@ def fetch_gdelt_logistics_articles(max_records: int = 90):
     except Exception:
         return []
 
-    # Deduplicar por URL o título
+    return dedupe_sort_articles(all_articles, max_records=max_records)
+
+def fetch_newsapi_logistics_articles(max_records: int = 80):
+    api_key = os.environ.get("NEWSAPI_KEY", "").strip()
+    if not api_key:
+        return []
+
+    articles = []
+    per_query = max(10, min(25, max_records // max(1, len(LOGISTICS_SEARCH_PHRASES))))
+
+    for query_name, query in LOGISTICS_SEARCH_PHRASES:
+        try:
+            params = {
+                "q": query,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "from": days_ago_iso(14),
+                "pageSize": per_query,
+                "apiKey": api_key,
+            }
+            url = "https://newsapi.org/v2/everything?" + urllib.parse.urlencode(params)
+            payload = fetch_json(url)
+
+            for item in payload.get("articles", [])[:per_query]:
+                source = item.get("source") or {}
+                articles.append(normalize_article({
+                    "title": item.get("title", ""),
+                    "description": item.get("description", "") or item.get("content", ""),
+                    "source": source.get("name", ""),
+                    "domain": article_domain_from_url(item.get("url", "")),
+                    "url": item.get("url", ""),
+                    "seendate": item.get("publishedAt", ""),
+                    "language": "en",
+                    "queryName": query_name,
+                    "provider": "newsapi",
+                }))
+        except Exception:
+            continue
+
+    return dedupe_sort_articles(articles, max_records=max_records)
+
+def fetch_guardian_logistics_articles(max_records: int = 60):
+    api_key = os.environ.get("GUARDIAN_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    articles = []
+    per_query = max(8, min(20, max_records // max(1, len(LOGISTICS_SEARCH_PHRASES))))
+
+    for query_name, query in LOGISTICS_SEARCH_PHRASES:
+        try:
+            # Guardian search works better with simpler strings.
+            simple_query = re.sub(r'["()]', "", query)
+            params = {
+                "q": simple_query,
+                "from-date": days_ago_iso(21),
+                "order-by": "newest",
+                "page-size": per_query,
+                "show-fields": "trailText",
+                "api-key": api_key,
+            }
+            url = "https://content.guardianapis.com/search?" + urllib.parse.urlencode(params)
+            payload = fetch_json(url)
+            response = payload.get("response") or {}
+
+            for item in response.get("results", [])[:per_query]:
+                fields = item.get("fields") or {}
+                articles.append(normalize_article({
+                    "title": item.get("webTitle", ""),
+                    "description": fields.get("trailText", ""),
+                    "source": "The Guardian",
+                    "domain": "theguardian.com",
+                    "url": item.get("webUrl", ""),
+                    "seendate": item.get("webPublicationDate", ""),
+                    "language": "en",
+                    "queryName": query_name,
+                    "provider": "guardian",
+                }))
+        except Exception:
+            continue
+
+    return dedupe_sort_articles(articles, max_records=max_records)
+
+def fetch_nyt_logistics_articles(max_records: int = 50):
+    api_key = os.environ.get("NYT_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    articles = []
+    per_query = max(5, min(10, max_records // max(1, len(LOGISTICS_SEARCH_PHRASES))))
+
+    for query_name, query in LOGISTICS_SEARCH_PHRASES:
+        try:
+            simple_query = re.sub(r'["()]', "", query)
+            params = {
+                "q": simple_query,
+                "begin_date": days_ago_compact(21),
+                "sort": "newest",
+                "api-key": api_key,
+            }
+            url = "https://api.nytimes.com/svc/search/v2/articlesearch.json?" + urllib.parse.urlencode(params)
+            payload = fetch_json(url)
+            docs = ((payload.get("response") or {}).get("docs") or [])[:per_query]
+
+            for item in docs:
+                headline = item.get("headline") or {}
+                articles.append(normalize_article({
+                    "title": headline.get("main", "") or item.get("abstract", ""),
+                    "description": item.get("abstract", "") or item.get("lead_paragraph", ""),
+                    "source": item.get("source", "") or "New York Times",
+                    "domain": "nytimes.com",
+                    "url": item.get("web_url", ""),
+                    "seendate": item.get("pub_date", ""),
+                    "language": "en",
+                    "queryName": query_name,
+                    "provider": "nyt",
+                }))
+        except Exception:
+            continue
+
+    return dedupe_sort_articles(articles, max_records=max_records)
+
+def fetch_rss_feed_articles(feed_name: str, url: str, provider: str = "rss", max_records: int = 30):
+    articles = []
+    try:
+        raw = fetch_binary(url, timeout=12)
+        root = ET.fromstring(raw)
+    except Exception:
+        return articles
+
+    for item in root.findall(".//item")[:max_records]:
+        title_node = item.find("title")
+        link_node = item.find("link")
+        pub_node = item.find("pubDate")
+        desc_node = item.find("description")
+        source_node = item.find("source")
+
+        title = title_node.text if title_node is not None else ""
+        link = link_node.text if link_node is not None else ""
+        pub_date = pub_node.text if pub_node is not None else ""
+        description = desc_node.text if desc_node is not None else ""
+
+        source_name = ""
+        source_domain = ""
+        if source_node is not None:
+            source_name = source_node.text or ""
+            source_domain = article_domain_from_url(source_node.attrib.get("url", ""))
+
+        # Google News RSS often gives Google URLs, but the source tag contains the real publisher.
+        domain = source_domain or article_domain_from_url(link)
+
+        articles.append(normalize_article({
+            "title": title,
+            "description": re.sub(r"<[^>]+>", " ", description or ""),
+            "source": source_name or domain or feed_name,
+            "domain": domain,
+            "url": link,
+            "seendate": pub_date,
+            "queryName": feed_name,
+            "provider": provider,
+        }))
+
+    return articles
+
+def fetch_rss_logistics_articles(max_records: int = 90):
+    articles = []
+
+    try:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(
+                    fetch_rss_feed_articles,
+                    name,
+                    url,
+                    "ukmto_rss" if "ukmto" in name else "rss",
+                    30,
+                )
+                for name, url in RSS_LOGISTICS_FEEDS
+            ]
+
+            for future in as_completed(futures):
+                try:
+                    articles.extend(future.result())
+                except Exception:
+                    pass
+    except Exception:
+        return []
+
+    return dedupe_sort_articles(articles, max_records=max_records)
+
+def fetch_ukmto_direct_articles(max_records: int = 20):
+    # UKMTO does not expose a simple official JSON feed here. This is intentionally conservative:
+    # it tries the public warnings page and extracts short warning-like snippets if accessible.
+    # If the page markup changes or blocks access, it safely returns [].
+    urls = [
+        "https://www.ukmto.org/ukmto-products/warnings",
+        "https://www.ukmto.org/ukmto-products/advisory",
+    ]
+    articles = []
+
+    for url in urls:
+        try:
+            html = fetch_text(url, timeout=12)
+            candidates = re.findall(r"<(?:h1|h2|h3|h4|a)[^>]*>(.*?)</(?:h1|h2|h3|h4|a)>", html, flags=re.I | re.S)
+            for raw_title in candidates:
+                title = re.sub(r"<[^>]+>", " ", raw_title)
+                title = re.sub(r"\s+", " ", title).strip()
+                lowered = title.lower()
+                if len(title) < 12:
+                    continue
+                if any(term in lowered for term in ["warning", "advisory", "incident", "vessel", "attack", "suspicious", "red sea", "gulf of aden"]):
+                    articles.append(normalize_article({
+                        "title": title,
+                        "description": "UKMTO public warnings/advisories page",
+                        "source": "UKMTO",
+                        "domain": "ukmto.org",
+                        "url": url,
+                        "seendate": datetime.utcnow().strftime("%Y-%m-%d"),
+                        "queryName": "ukmto_direct",
+                        "provider": "ukmto_rss",
+                    }))
+        except Exception:
+            continue
+
+    return dedupe_sort_articles(articles, max_records=max_records)
+
+def dedupe_sort_articles(articles, max_records: int = 120):
     deduped = {}
-    for article in all_articles:
+
+    for raw_article in articles or []:
+        article = normalize_article(raw_article)
         key = article.get("url") or article.get("title")
         key = str(key or "").strip().lower()
 
         if not key:
             continue
 
-        if key not in deduped:
+        # Prefer richer article version if duplicate.
+        existing = deduped.get(key)
+        if not existing or len(article.get("description", "")) > len(existing.get("description", "")):
             deduped[key] = article
 
-    articles = list(deduped.values())
-
-    # Priorizar recientes y fuentes fuertes
-    articles.sort(
+    clean = list(deduped.values())
+    clean.sort(
         key=lambda a: (
-            recency_weight(a.get("seendate", "")) * source_weight(a.get("domain", "")),
+            recency_weight(a.get("seendate", "")) *
+            source_weight(a.get("domain", "")) *
+            provider_weight(a.get("provider", "")),
             a.get("seendate", "")
         ),
         reverse=True
     )
 
-    return articles[:max_records]
+    return clean[:max_records]
 
+def fetch_multi_source_logistics_articles(max_records: int = 180):
+    providers = [
+        ("gdelt", fetch_gdelt_logistics_articles, 90),
+        ("newsapi", fetch_newsapi_logistics_articles, 80),
+        ("guardian", fetch_guardian_logistics_articles, 60),
+        ("nyt", fetch_nyt_logistics_articles, 50),
+        ("rss", fetch_rss_logistics_articles, 90),
+        ("ukmto_direct", fetch_ukmto_direct_articles, 20),
+    ]
+
+    all_articles = []
+    provider_errors = {}
+    provider_counts = {}
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = {
+                executor.submit(fn, limit): name
+                for name, fn, limit in providers
+            }
+
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    items = future.result() or []
+                    provider_counts[name] = len(items)
+                    all_articles.extend(items)
+                except Exception as error:
+                    provider_errors[name] = str(error)
+                    provider_counts[name] = 0
+    except Exception as error:
+        provider_errors["multi_source"] = str(error)
+
+    articles = dedupe_sort_articles(all_articles, max_records=max_records)
+    return articles, provider_counts, provider_errors
 
 def logistics_level(score):
     score = float(score)
@@ -1243,24 +1667,116 @@ def logistics_level(score):
 
     return "bajo"
 
+def market_logistics_proxy_score():
+    # Used only as low-confidence fallback or tie-breaker when news sources are scarce.
+    fred_key = os.environ.get("FRED_API_KEY", "").strip()
+    components = []
+    drivers = []
 
-def heuristic_logistics_score(articles):
+    if not fred_key:
+        return None
+
+    try:
+        brent = fetch_fred_latest("DCOILBRENTEU", fred_key)
+        value = float(brent.get("latest", 0))
+        points = clamp((value - 75) * 0.8, 0, 22)
+        components.append(points)
+        if value >= 95:
+            drivers.append("Brent alto")
+    except Exception:
+        pass
+
+    try:
+        vix = fetch_fred_latest("VIXCLS", fred_key)
+        value = float(vix.get("latest", 0))
+        points = clamp((value - 16) * 0.9, 0, 18)
+        components.append(points)
+        if value >= 25:
+            drivers.append("VIX elevado")
+    except Exception:
+        pass
+
+    try:
+        credit = fetch_fred_latest("BAMLH0A0HYM2", fred_key)
+        value = float(credit.get("latest", 0))
+        points = clamp((value - 3.0) * 6, 0, 18)
+        components.append(points)
+        if value >= 5:
+            drivers.append("spreads HY elevados")
+    except Exception:
+        pass
+
+    try:
+        gscpi = fetch_gscpi_latest()
+        value = float(gscpi.get("latest", 0))
+        points = clamp((value + 0.25) * 12, 0, 18)
+        components.append(points)
+        if value >= 1:
+            drivers.append("GSCPI elevado")
+    except Exception:
+        pass
+
+    if not components:
+        return None
+
+    score = 25 + sum(components)
+    score = round(clamp(score, 20, 75))
+
+    return {
+        "score": score,
+        "level": logistics_level(score),
+        "confidence": 0.18,
+        "drivers": drivers or ["proxy mercado"],
+        "summary": "Proxy de mercado usado con baja confianza porque las fuentes de noticias fueron insuficientes.",
+    }
+
+def heuristic_logistics_score(articles, provider_counts=None, provider_errors=None, market_proxy=None):
+    provider_counts = provider_counts or {}
+    provider_errors = provider_errors or {}
+
     if not articles:
+        if market_proxy:
+            return {
+                "score": market_proxy["score"],
+                "level": market_proxy["level"],
+                "confidence": market_proxy["confidence"],
+                "summary": market_proxy["summary"],
+                "drivers": market_proxy["drivers"] + ["sin noticias multi-fuente"],
+                "diagnostics": {
+                    "articleCount": 0,
+                    "sourceDiversity": 0,
+                    "providerDiversity": 0,
+                    "crisisArticles": 0,
+                    "severeArticles": 0,
+                    "reliefArticles": 0,
+                    "weightedCrisis": 0,
+                    "weightedRelief": 0,
+                    "sampleTitles": [],
+                    "providerCounts": provider_counts,
+                    "providerErrors": provider_errors,
+                    "fallback": "market_proxy",
+                }
+            }
+
         return {
             "score": 45,
             "level": "moderado",
-            "confidence": 0.10,
-            "summary": "No se pudieron obtener titulares recientes de GDELT; se usa valor neutral-bajo y baja confianza.",
-            "drivers": ["sin datos GDELT"],
+            "confidence": 0.06,
+            "summary": "No se pudieron obtener noticias recientes de ninguna fuente; el valor es neutral-bajo y no debe interpretarse como lectura real de riesgo.",
+            "drivers": ["sin datos multi-fuente"],
             "diagnostics": {
                 "articleCount": 0,
                 "sourceDiversity": 0,
+                "providerDiversity": 0,
                 "crisisArticles": 0,
                 "severeArticles": 0,
                 "reliefArticles": 0,
                 "weightedCrisis": 0,
                 "weightedRelief": 0,
                 "sampleTitles": [],
+                "providerCounts": provider_counts,
+                "providerErrors": provider_errors,
+                "fallback": "neutral_low_confidence",
             }
         }
 
@@ -1269,38 +1785,65 @@ def heuristic_logistics_score(articles):
     crisis_articles = 0
     severe_articles = 0
     relief_articles = 0
+    political_relief_only_articles = 0
+    hormuz_crisis_articles = 0
+    operational_normalization_articles = 0
     domains = set()
+    providers = set()
     drivers = []
     sample_titles = []
 
     for article in articles:
         title = str(article.get("title") or "")
+        description = str(article.get("description") or "")
         domain = str(article.get("domain") or "").lower().replace("www.", "")
+        provider = str(article.get("provider") or "")
         query_name = str(article.get("queryName") or "")
-        text = title.lower()
+        text = f"{title} {description}".lower()
 
         domains.add(domain)
+        providers.add(provider)
 
         crisis_points, crisis_hits = term_score(text, CRISIS_TERMS)
         relief_points, relief_hits = term_score(text, RELIEF_TERMS)
 
-        # Si una noticia habla de "ceasefire" pero también de standstill/ataques,
-        # no debe contar como alivio real.
+        relief_hit_set = set(relief_hits)
+        has_operational_relief = bool(relief_hit_set - POLITICAL_RELIEF_ONLY_TERMS)
+
+        # A ceasefire or agreement alone should not reduce logistics stress much unless it is
+        # accompanied by operational evidence: traffic resumes, carriers resume, routes restored, etc.
+        if relief_hit_set and not has_operational_relief:
+            political_relief_only_articles += 1
+            relief_points *= 0.25
+
+        # If the same article mentions attacks/standstill and ceasefire, treat it as unresolved crisis.
         if crisis_points >= 12:
             relief_points *= 0.30
 
-        # Bonus específico para Ormuz porque es una ruta energética crítica.
+        # Specific bonus for Hormuz because it is a critical energy chokepoint.
         if "hormuz" in text or "strait of hormuz" in text:
-            if crisis_points >= 10:
-                crisis_points += 12
-            if relief_points >= 10 and crisis_points < 8:
-                relief_points += 8
+            if crisis_points >= 8:
+                crisis_points += 16
+                hormuz_crisis_articles += 1
+            if has_operational_relief and relief_points >= 10 and crisis_points < 8:
+                relief_points += 10
 
-        # Bonus si la consulta que la encontró era de normalización.
-        if query_name == "normalization" and relief_points >= 10 and crisis_points < 8:
+        # Specific bonus for UKMTO incident items.
+        if "ukmto" in text or domain == "ukmto.org" or provider_key(provider).startswith("ukmto"):
+            if crisis_points >= 8:
+                crisis_points += 8
+
+        if query_name == "normalization" and has_operational_relief and relief_points >= 10 and crisis_points < 8:
             relief_points += 6
 
-        article_weight = recency_weight(article.get("seendate", "")) * source_weight(domain)
+        if has_operational_relief and crisis_points < 8:
+            operational_normalization_articles += 1
+
+        article_weight = (
+            recency_weight(article.get("seendate", "")) *
+            source_weight(domain) *
+            provider_weight(provider)
+        )
 
         weighted_crisis += crisis_points * article_weight
         weighted_relief += relief_points * article_weight
@@ -1308,58 +1851,71 @@ def heuristic_logistics_score(articles):
         if crisis_points >= 8:
             crisis_articles += 1
 
-        if crisis_points >= 20:
+        if crisis_points >= 24:
             severe_articles += 1
 
         if relief_points >= 10 and crisis_points < 8:
             relief_articles += 1
 
         for hit in crisis_hits + relief_hits:
-            if hit not in drivers and len(drivers) < 12:
+            if hit not in drivers and len(drivers) < 14:
                 drivers.append(hit)
 
-        if len(sample_titles) < 6 and title:
+        if len(sample_titles) < 8 and title:
             sample_titles.append(title)
 
     article_count = len(articles)
     source_diversity = len([d for d in domains if d])
+    provider_diversity = len([p for p in providers if p])
 
-    coverage_bonus = min(12, article_count * 0.18)
-    diversity_bonus = min(10, source_diversity * 1.25)
+    coverage_bonus = min(14, article_count * 0.16)
+    diversity_bonus = min(12, source_diversity * 1.0)
+    provider_bonus = min(8, provider_diversity * 1.6)
 
     net_pressure = weighted_crisis - weighted_relief
+    score = 24 + net_pressure * 0.40 + coverage_bonus + diversity_bonus + provider_bonus
 
-    score = 25 + net_pressure * 0.42 + coverage_bonus + diversity_bonus
-
-    # Si hay varias noticias severas recientes, elevar el piso.
+    # Strong floors for severe operational disruption.
     if severe_articles >= 3:
         score = max(score, 82)
 
     if severe_articles >= 5:
         score = max(score, 88)
 
-    # Si hay señales claras de normalización y pocas señales severas, bajar techo.
-    if relief_articles >= 3 and severe_articles <= 1:
-        score = min(score, 45)
+    if hormuz_crisis_articles >= 2 and severe_articles >= 2:
+        score = max(score, 86)
 
-    if relief_articles >= 5 and crisis_articles <= 2:
-        score = min(score, 35)
+    if hormuz_crisis_articles >= 4:
+        score = max(score, 90)
 
-    # Si predominan noticias positivas sobre negativas, bajar más.
-    if weighted_relief > weighted_crisis * 1.4 and severe_articles == 0:
-        score = min(score, 30)
+    # Market proxy should only support the score, not dominate actual news.
+    if market_proxy and article_count < 10:
+        score = max(score, market_proxy["score"] * 0.85)
+
+    # Clear operational normalization lowers score. Political relief alone does not.
+    if operational_normalization_articles >= 3 and severe_articles <= 1 and hormuz_crisis_articles <= 1:
+        score = min(score, 48)
+
+    if operational_normalization_articles >= 5 and crisis_articles <= 2:
+        score = min(score, 38)
+
+    if weighted_relief > weighted_crisis * 1.45 and severe_articles == 0 and operational_normalization_articles >= 2:
+        score = min(score, 32)
 
     score = round(clamp(score))
 
-    confidence = 0.25
-    confidence += min(0.35, article_count / 120)
-    confidence += min(0.25, source_diversity / 40)
-    if severe_articles >= 3 or relief_articles >= 3:
+    confidence = 0.18
+    confidence += min(0.30, article_count / 150)
+    confidence += min(0.22, source_diversity / 35)
+    confidence += min(0.18, provider_diversity / 10)
+    if severe_articles >= 3 or operational_normalization_articles >= 3:
         confidence += 0.10
-    confidence = round(min(confidence, 0.92), 2)
+    if provider_errors and provider_diversity <= 1:
+        confidence -= 0.08
+    confidence = round(max(0.05, min(confidence, 0.94)), 2)
 
     if score >= 80:
-        summary = "Disrupción logística severa detectada por noticias recientes: cierres, ataques, capturas, suspensión de rutas o desvíos relevantes."
+        summary = "Disrupción logística severa detectada por múltiples fuentes: cierres, ataques, capturas, suspensión de rutas, tráfico paralizado o desvíos relevantes."
     elif score >= 60:
         summary = "Estrés logístico alto: hay señales relevantes de ataques, restricciones, seguros marítimos, desvíos o tensión en rutas clave."
     elif score >= 40:
@@ -1367,10 +1923,13 @@ def heuristic_logistics_score(articles):
     elif score >= 20:
         summary = "Estrés logístico leve: ruido geopolítico u operativo, pero con señales limitadas de disrupción."
     else:
-        summary = "Estrés logístico bajo: predominan señales de rutas abiertas, normalización o ausencia de eventos críticos."
+        summary = "Estrés logístico bajo: predominan señales de rutas abiertas, normalización operativa o ausencia de eventos críticos."
 
-    if relief_articles >= 3 and score <= 45:
-        summary = "Las noticias recientes sugieren normalización: reapertura, acuerdo, tráfico retomándose o reducción de tensiones logísticas."
+    if political_relief_only_articles >= 2 and operational_normalization_articles == 0 and score >= 60:
+        summary += " Hay señales políticas de alivio, pero no bastan para bajar el score porque no confirman normalización operativa."
+
+    if operational_normalization_articles >= 3 and score <= 48:
+        summary = "Las fuentes recientes sugieren normalización operativa: reapertura, tráfico retomándose, navieras volviendo a rutas o costes de seguro/flete bajando."
 
     return {
         "score": score,
@@ -1381,25 +1940,37 @@ def heuristic_logistics_score(articles):
         "diagnostics": {
             "articleCount": article_count,
             "sourceDiversity": source_diversity,
+            "providerDiversity": provider_diversity,
             "crisisArticles": crisis_articles,
             "severeArticles": severe_articles,
+            "hormuzCrisisArticles": hormuz_crisis_articles,
             "reliefArticles": relief_articles,
+            "operationalNormalizationArticles": operational_normalization_articles,
+            "politicalReliefOnlyArticles": political_relief_only_articles,
             "weightedCrisis": round(weighted_crisis, 2),
             "weightedRelief": round(weighted_relief, 2),
             "sampleTitles": sample_titles,
+            "providerCounts": provider_counts,
+            "providerErrors": provider_errors,
+            "fallback": None,
         }
     }
-
 
 def ai_logistics_score(articles):
     # Versión gratuita: sin OpenAI API.
     # Se mantiene esta función como stub para conservar estructura.
     return None
 
-
 def assess_logistics_stress_from_news():
-    articles = fetch_gdelt_logistics_articles(90)
-    heuristic = heuristic_logistics_score(articles)
+    articles, provider_counts, provider_errors = fetch_multi_source_logistics_articles(180)
+    market_proxy = market_logistics_proxy_score()
+
+    heuristic = heuristic_logistics_score(
+        articles,
+        provider_counts=provider_counts,
+        provider_errors=provider_errors,
+        market_proxy=market_proxy,
+    )
 
     ai_result = None
     try:
@@ -1408,18 +1979,21 @@ def assess_logistics_stress_from_news():
         ai_result = None
 
     result = ai_result or heuristic
+    source = "Multi-source logistics news engine"
+    if result.get("diagnostics", {}).get("fallback") == "market_proxy":
+        source = "Market proxy fallback + unavailable news sources"
 
     return {
         "latest": result["score"],
         "previous": None,
         "date": datetime.utcnow().strftime("%Y-%m-%d"),
-        "source": "GDELT multi-query dynamic heuristic",
+        "source": source,
         "level": result["level"],
         "confidence": result["confidence"],
         "summary": result["summary"],
         "drivers": result["drivers"],
         "articleCount": len(articles),
-        "sampleArticles": articles[:10],
+        "sampleArticles": articles[:12],
         "diagnostics": result.get("diagnostics", {}),
     }
 
