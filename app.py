@@ -22,13 +22,13 @@ def fetch_json(url: str, method: str = "GET", body: dict | None = None):
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def fetch_fred_latest(series_id: str, api_key: str):
+def fetch_fred_latest(series_id: str, api_key: str, limit: int = 2):
     params = urllib.parse.urlencode({
         "series_id": series_id,
         "api_key": api_key,
         "file_type": "json",
         "sort_order": "desc",
-        "limit": 2,
+        "limit": limit,
     })
 
     url = f"https://api.stlouisfed.org/fred/series/observations?{params}"
@@ -49,6 +49,18 @@ def fetch_fred_latest(series_id: str, api_key: str):
         "latest": latest,
         "previous": previous,
         "date": observations[0]["date"],
+        "series": series_id,
+    }
+
+def fetch_fred_pair_spread(series_a: str, series_b: str, api_key: str):
+    a = fetch_fred_latest(series_a, api_key)
+    b = fetch_fred_latest(series_b, api_key)
+    return {
+        "latest": round(a["latest"] - b["latest"], 3),
+        "previous": None,
+        "date": max(a["date"], b["date"]),
+        "series": f"{series_a}-{series_b}",
+        "parts": {series_a: a["latest"], series_b: b["latest"]},
     }
 
 def fetch_bls_core_yoy(series_id: str, registration_key: str | None = None):
@@ -107,13 +119,14 @@ def fetch_bls_core_yoy(series_id: str, registration_key: str | None = None):
         "latestIndex": latest_value,
         "previousIndex": previous_value,
         "date": f"{latest['year']}-{latest['period'][1:]}",
+        "series": series_id,
     }
 
 @app.get("/")
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend del dashboard funcionando",
+        "message": "Backend pro del dashboard funcionando",
         "endpoints": ["/health", "/api/official-data"],
     })
 
@@ -126,6 +139,7 @@ def health():
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
             "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
+            "version": "pro-env-keys-v1",
         }
     })
 
@@ -158,18 +172,38 @@ def official_data():
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
                 "blsSeries": bls_series,
+                "version": "pro-env-keys-v1",
             }
         }
 
         if fred_key:
-            brent = fetch_fred_latest("DCOILBRENTEU", fred_key)
-            high_yield_oas = fetch_fred_latest("BAMLH0A0HYM2", fred_key)
+            fred_jobs = {
+                "brent": ("DCOILBRENTEU", "Brent"),
+                "creditSpreads": ("BAMLH0A0HYM2", "HY OAS"),
+                "vix": ("VIXCLS", "VIX"),
+                "usdStrength": ("DTWEXBGS", "USD trade weighted"),
+                "tenYearYield": ("DGS10", "Treasury 10Y"),
+                "twoYearYield": ("DGS2", "Treasury 2Y"),
+                "tenYearBreakeven": ("T10YIE", "Inflation breakeven 10Y"),
+                "realYield10y": ("DFII10", "Real yield 10Y"),
+                "unemployment": ("UNRATE", "Unemployment"),
+            }
 
-            out["updates"]["brent"] = brent
-            out["updates"]["creditSpreads"] = high_yield_oas
+            for key, (series, label) in fred_jobs.items():
+                try:
+                    value = fetch_fred_latest(series, fred_key)
+                    out["updates"][key] = value
+                    out["messages"].append(f"{label} actualizado ({value['date']})")
+                except Exception as error:
+                    out["messages"].append(f"Error {label}: {error}")
 
-            out["messages"].append(f"Brent actualizado ({brent['date']})")
-            out["messages"].append(f"HY OAS actualizado ({high_yield_oas['date']})")
+            try:
+                curve = fetch_fred_pair_spread("DGS10", "DGS2", fred_key)
+                out["updates"]["yieldCurve10y2y"] = curve
+                out["messages"].append(f"Curva 10Y-2Y actualizada ({curve['date']})")
+            except Exception as error:
+                out["messages"].append(f"Error curva 10Y-2Y: {error}")
+
         else:
             out["messages"].append("FRED_API_KEY no está configurada en Render")
 
