@@ -1,8 +1,8 @@
-Backend PRO + Estrés Logístico gratuito listo para Render.
+Backend PRO gratuito con Estrés Logístico + PMI por noticias.
 
-NO requiere tarjeta de OpenAI.
+NO requiere OpenAI.
+NO requiere tarjeta.
 NO requiere OPENAI_API_KEY.
-NO requiere LOGISTICS_CACHE_HOURS.
 
 CONFIGURACIÓN EN RENDER:
 Build Command:
@@ -18,7 +18,6 @@ BLS_SERIES = CUUR0000SA0L1E
 
 QUÉ HACE:
 - Actualiza indicadores FRED/BLS.
-- Consulta titulares recientes vía GDELT.
-- Calcula Estrés logístico con una heurística gratuita basada en palabras clave.
-- No usa OpenAI API.
-- No tiene coste por IA.
+- Calcula Estrés logístico con GDELT + heurística gratuita.
+- Intenta extraer JPMorgan Global Composite PMI desde noticias/titulares recientes vía GDELT.
+- Si PMI no puede extraerse, mantiene el último valor guardado en el frontend.

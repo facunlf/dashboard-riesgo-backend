@@ -2,6 +2,7 @@ import os
 import json
 import urllib.parse
 import urllib.request
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -27,6 +28,12 @@ LOGISTICS_QUERY = (
     '"Strait of Hormuz" OR "Red Sea shipping" OR "Suez Canal" OR "port congestion" OR '
     '"tanker attack" OR "container shipping" OR "freight rates" OR "shipping route diversion" OR '
     '"vessel attacks" OR "maritime security")'
+)
+
+PMI_QUERY = (
+    '("JPMorgan Global Composite PMI" OR "J.P.Morgan Global Composite PMI" OR '
+    '"J.P. Morgan Global Composite PMI" OR "Global Composite PMI Output Index" OR '
+    '"global composite pmi")'
 )
 
 def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers: dict | None = None):
@@ -352,12 +359,99 @@ def assess_logistics_stress_from_news():
         "sampleArticles": articles[:6],
     }
 
+
+def fetch_gdelt_pmi_articles(max_records: int = 20):
+    params = {
+        "query": PMI_QUERY,
+        "mode": "artlist",
+        "format": "json",
+        "maxrecords": max_records,
+        "sort": "hybridrel",
+        "timespan": "60d",
+    }
+
+    url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+    payload = fetch_json(url)
+
+    articles = []
+    for item in payload.get("articles", [])[:max_records]:
+        articles.append({
+            "title": item.get("title", ""),
+            "source": item.get("sourceCountry", "") or item.get("domain", ""),
+            "domain": item.get("domain", ""),
+            "url": item.get("url", ""),
+            "seendate": item.get("seendate", ""),
+            "language": item.get("language", ""),
+        })
+
+    return articles
+
+def extract_pmi_value_from_text(text: str):
+    patterns = [
+        r'(?:J\\.?P\\.?\\s?Morgan|JPMorgan).*?(?:Global Composite PMI|Global PMI|Composite PMI).*?(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|at|was|posted|registered|came in at)\\s+(\\d{1,2}(?:\\.\\d)?)',
+        r'(?:Global Composite PMI|Global PMI|Composite PMI).*?(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|at|was|posted|registered|came in at)\\s+(\\d{1,2}(?:\\.\\d)?)',
+        r'(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|posted|registered|came in at)\\s+(\\d{1,2}(?:\\.\\d)?).*?(?:Global Composite PMI|Global PMI|Composite PMI)',
+        r'\\b(\\d{1,2}(?:\\.\\d)?)\\b.*?(?:Global Composite PMI|Global PMI|Composite PMI)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = float(match.group(1))
+            if 30 <= value <= 70:
+                return round(value, 1)
+
+    return None
+
+def assess_global_pmi_from_news():
+    articles = fetch_gdelt_pmi_articles(20)
+
+    candidates = []
+    for article in articles:
+        title = article.get("title", "") or ""
+        value = extract_pmi_value_from_text(title)
+        if value is not None:
+            candidates.append({
+                "value": value,
+                "title": title,
+                "domain": article.get("domain", ""),
+                "url": article.get("url", ""),
+                "seendate": article.get("seendate", ""),
+            })
+
+    if not candidates:
+        return {
+            "latest": None,
+            "previous": None,
+            "date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "source": "GDELT PMI news parser",
+            "confidence": 0.0,
+            "summary": "No se pudo extraer automáticamente un valor de JPMorgan Global Composite PMI desde titulares recientes.",
+            "articleCount": len(articles),
+            "sampleArticles": articles[:6],
+        }
+
+    # Preferimos el resultado más reciente que haya pasado validación.
+    chosen = candidates[0]
+
+    return {
+        "latest": chosen["value"],
+        "previous": None,
+        "date": chosen.get("seendate", "")[:8] or datetime.utcnow().strftime("%Y-%m-%d"),
+        "source": "GDELT PMI news parser",
+        "confidence": 0.55,
+        "summary": f"PMI global extraído desde noticia/titular: {chosen['title']}",
+        "articleCount": len(articles),
+        "sampleArticles": articles[:6],
+        "matchedArticle": chosen,
+    }
+
 @app.get("/")
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO Free Logistics del dashboard funcionando",
-        "endpoints": ["/health", "/api/official-data", "/api/history", "/api/logistics-stress-news"],
+        "message": "Backend PRO Free Logistics + PMI del dashboard funcionando",
+        "endpoints": ["/health", "/api/official-data", "/api/history", "/api/logistics-stress-news", "/api/global-pmi-news"],
     })
 
 @app.get("/health")
@@ -369,7 +463,7 @@ def health():
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
             "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
-            "version": "pro-free-logistics-v1",
+            "version": "pro-free-logistics-pmi-v1",
         }
     })
 
@@ -402,7 +496,7 @@ def official_data():
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
                 "blsSeries": bls_series,
-                "version": "pro-free-logistics-v1",
+                "version": "pro-free-logistics-pmi-v1",
             }
         }
 
@@ -443,15 +537,37 @@ def official_data():
         except Exception as error:
             out["messages"].append(f"Error estrés logístico con noticias: {error}")
 
+        try:
+            pmi = assess_global_pmi_from_news()
+            out["globalPmiNews"] = pmi
+            if pmi.get("latest") is not None:
+                out["updates"]["globalPMI"] = pmi
+                out["messages"].append(
+                    f"PMI global estimado desde noticias: {pmi['latest']} "
+                    f"(confianza {round(pmi.get('confidence', 0) * 100)}%)"
+                )
+            else:
+                out["messages"].append("PMI global no pudo extraerse automáticamente desde noticias recientes")
+        except Exception as error:
+            out["messages"].append(f"Error PMI global por noticias: {error}")
+
         return jsonify(out)
 
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
 
-@app.post("/api/logistics-stress-news")
+@app.post("/api/logistics-stress-news", "/api/global-pmi-news")
 def logistics_stress_news():
     try:
         result = assess_logistics_stress_from_news()
+        return jsonify({"ok": True, "result": result})
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
+
+@app.post("/api/global-pmi-news")
+def global_pmi_news():
+    try:
+        result = assess_global_pmi_from_news()
         return jsonify({"ok": True, "result": result})
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
