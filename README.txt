@@ -1,23 +1,23 @@
-Backend basado en v14 + Riesgo de Recesión por noticias macro.
+Backend v14 + recesión calculada — FIX de errores.
 
-NO requiere OpenAI.
-NO requiere tarjeta.
+Cambios:
+- Se quitó GSCPI de FRED porque el código GSCPI devuelve HTTP 400 en FRED.
+- BLS ahora ignora valores "-", ".", vacíos o no numéricos.
+- GDELT ahora falla de forma segura: si no devuelve JSON o no responde, usa fallback neutral y no rompe el dashboard.
+- Se mantienen:
+  - FRED/BLS
+  - PMI por noticias GDELT
+  - estrés logístico por noticias GDELT
+  - noticias macro/recesión por GDELT
 
-CONFIGURACIÓN EN RENDER:
+Render:
 Build Command:
 pip install -r requirements.txt
 
 Start Command:
 gunicorn app:app
 
-VARIABLES DE ENTORNO:
-FRED_API_KEY = tu clave de FRED
-BLS_API_KEY = tu clave de BLS, opcional
+Variables:
+FRED_API_KEY
+BLS_API_KEY opcional
 BLS_SERIES = CUUR0000SA0L1E
-
-QUÉ HACE:
-- Actualiza FRED/BLS.
-- Calcula estrés logístico vía GDELT + heurística.
-- Intenta extraer JPMorgan Global Composite PMI desde noticias/titulares vía GDELT.
-- Calcula un score de noticias macro/recesión vía GDELT + heurística.
-- El frontend usa ese score como parte del cálculo ponderado de Riesgo de Recesión.

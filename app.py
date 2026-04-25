@@ -20,14 +20,12 @@ FRED_SERIES = {
     "tenYearBreakeven": ("T10YIE", "Inflation breakeven 10Y"),
     "realYield10y": ("DFII10", "Real yield 10Y"),
     "unemployment": ("UNRATE", "Unemployment"),
-    "gscpi": ("GSCPI", "Global Supply Chain Pressure Index"),
 }
 
 LOGISTICS_QUERY = (
-    '("shipping disruption" OR "maritime insurance" OR "war risk insurance" OR '
-    '"Strait of Hormuz" OR "Red Sea shipping" OR "Suez Canal" OR "port congestion" OR '
-    '"tanker attack" OR "container shipping" OR "freight rates" OR "shipping route diversion" OR '
-    '"vessel attacks" OR "maritime security")'
+    '"shipping disruption" OR "maritime insurance" OR "Strait of Hormuz" OR '
+    '"Red Sea shipping" OR "Suez Canal" OR "port congestion" OR '
+    '"tanker attack" OR "freight rates" OR "shipping route diversion"'
 )
 
 PMI_QUERY = (
@@ -37,10 +35,9 @@ PMI_QUERY = (
 )
 
 MACRO_RECESSION_QUERY = (
-    '("recession risk" OR "global recession" OR "economic slowdown" OR '
-    '"hard landing" OR "soft landing" OR "credit stress" OR "yield curve" OR '
-    '"unemployment rising" OR "consumer demand slowdown" OR "manufacturing contraction" OR '
-    '"services contraction" OR "global growth forecast cut" OR "stagflation risk")'
+    '"recession risk" OR "global recession" OR "economic slowdown" OR '
+    '"hard landing" OR "credit stress" OR "yield curve" OR '
+    '"unemployment rising" OR "consumer demand slowdown" OR "global growth forecast cut"'
 )
 
 def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers: dict | None = None):
@@ -51,10 +48,22 @@ def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers:
         data = json.dumps(body).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
 
+    # Some public endpoints are less likely to reject requests with a User-Agent.
+    req_headers.setdefault("User-Agent", "macro-risk-dashboard/1.0")
+
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
 
     with urllib.request.urlopen(req, timeout=45) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+
+        if not raw:
+            raise ValueError("Respuesta vacía del proveedor")
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as error:
+            preview = raw[:160].replace("\n", " ")
+            raise ValueError(f"Respuesta no JSON del proveedor: {preview}") from error
 
 def fred_observations(series_id: str, api_key: str, start: str | None = None, end: str | None = None):
     params = {
@@ -75,7 +84,7 @@ def fred_observations(series_id: str, api_key: str, start: str | None = None, en
     observations = []
     for item in payload.get("observations", []):
         value = item.get("value")
-        if value in (".", "", None):
+        if value in (".", "-", "", None):
             continue
         try:
             observations.append({"date": item["date"], "value": float(value)})
@@ -139,10 +148,19 @@ def fetch_bls_series(series_id: str, start_year: int, end_year: int, registratio
 
     rows = []
     for item in monthly:
+        raw_value = item.get("value")
+        if raw_value in (None, "", "-", "."):
+            continue
+
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+
         month = item["period"][1:]
         rows.append({
             "date": f"{item['year']}-{month.zfill(2)}-01",
-            "value": float(item["value"]),
+            "value": numeric_value,
             "year": int(item["year"]),
             "month": int(month),
         })
@@ -268,32 +286,44 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
     return rows
 
 def fetch_gdelt_logistics_articles(max_records: int = 25):
-    params = {
-        "query": LOGISTICS_QUERY,
-        "mode": "artlist",
-        "format": "json",
-        "maxrecords": max_records,
-        "sort": "hybridrel",
-        "timespan": "7d",
-    }
+    try:
+        params = {
+            "query": LOGISTICS_QUERY,
+            "mode": "artlist",
+            "format": "json",
+            "maxrecords": max_records,
+            "sort": "hybridrel",
+            "timespan": "7d",
+        }
 
-    url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
-    payload = fetch_json(url)
+        url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+        payload = fetch_json(url)
 
-    articles = []
-    for item in payload.get("articles", [])[:max_records]:
-        articles.append({
-            "title": item.get("title", ""),
-            "source": item.get("sourceCountry", "") or item.get("domain", ""),
-            "domain": item.get("domain", ""),
-            "url": item.get("url", ""),
-            "seendate": item.get("seendate", ""),
-            "language": item.get("language", ""),
-        })
+        articles = []
+        for item in payload.get("articles", [])[:max_records]:
+            articles.append({
+                "title": item.get("title", ""),
+                "source": item.get("sourceCountry", "") or item.get("domain", ""),
+                "domain": item.get("domain", ""),
+                "url": item.get("url", ""),
+                "seendate": item.get("seendate", ""),
+                "language": item.get("language", ""),
+            })
 
-    return articles
+        return articles
+    except Exception:
+        return []
 
 def heuristic_logistics_score(articles):
+    if not articles:
+        return {
+            "score": 50,
+            "level": "moderado",
+            "confidence": 0.15,
+            "summary": "No se pudieron obtener titulares recientes de GDELT; se usa valor neutral preventivo.",
+            "drivers": ["sin datos GDELT"],
+        }
+
     text = " ".join((a.get("title") or "").lower() for a in articles)
 
     severe_terms = [
@@ -368,30 +398,33 @@ def assess_logistics_stress_from_news():
 
 
 def fetch_gdelt_pmi_articles(max_records: int = 20):
-    params = {
-        "query": PMI_QUERY,
-        "mode": "artlist",
-        "format": "json",
-        "maxrecords": max_records,
-        "sort": "hybridrel",
-        "timespan": "60d",
-    }
+    try:
+        params = {
+            "query": PMI_QUERY,
+            "mode": "artlist",
+            "format": "json",
+            "maxrecords": max_records,
+            "sort": "hybridrel",
+            "timespan": "60d",
+        }
 
-    url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
-    payload = fetch_json(url)
+        url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+        payload = fetch_json(url)
 
-    articles = []
-    for item in payload.get("articles", [])[:max_records]:
-        articles.append({
-            "title": item.get("title", ""),
-            "source": item.get("sourceCountry", "") or item.get("domain", ""),
-            "domain": item.get("domain", ""),
-            "url": item.get("url", ""),
-            "seendate": item.get("seendate", ""),
-            "language": item.get("language", ""),
-        })
+        articles = []
+        for item in payload.get("articles", [])[:max_records]:
+            articles.append({
+                "title": item.get("title", ""),
+                "source": item.get("sourceCountry", "") or item.get("domain", ""),
+                "domain": item.get("domain", ""),
+                "url": item.get("url", ""),
+                "seendate": item.get("seendate", ""),
+                "language": item.get("language", ""),
+            })
 
-    return articles
+        return articles
+    except Exception:
+        return []
 
 def extract_pmi_value_from_text(text: str):
     patterns = [
@@ -455,30 +488,33 @@ def assess_global_pmi_from_news():
 
 
 def fetch_gdelt_macro_articles(max_records: int = 30):
-    params = {
-        "query": MACRO_RECESSION_QUERY,
-        "mode": "artlist",
-        "format": "json",
-        "maxrecords": max_records,
-        "sort": "hybridrel",
-        "timespan": "14d",
-    }
+    try:
+        params = {
+            "query": MACRO_RECESSION_QUERY,
+            "mode": "artlist",
+            "format": "json",
+            "maxrecords": max_records,
+            "sort": "hybridrel",
+            "timespan": "14d",
+        }
 
-    url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
-    payload = fetch_json(url)
+        url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+        payload = fetch_json(url)
 
-    articles = []
-    for item in payload.get("articles", [])[:max_records]:
-        articles.append({
-            "title": item.get("title", ""),
-            "source": item.get("sourceCountry", "") or item.get("domain", ""),
-            "domain": item.get("domain", ""),
-            "url": item.get("url", ""),
-            "seendate": item.get("seendate", ""),
-            "language": item.get("language", ""),
-        })
+        articles = []
+        for item in payload.get("articles", [])[:max_records]:
+            articles.append({
+                "title": item.get("title", ""),
+                "source": item.get("sourceCountry", "") or item.get("domain", ""),
+                "domain": item.get("domain", ""),
+                "url": item.get("url", ""),
+                "seendate": item.get("seendate", ""),
+                "language": item.get("language", ""),
+            })
 
-    return articles
+        return articles
+    except Exception:
+        return []
 
 def assess_macro_news_recession_score():
     articles = fetch_gdelt_macro_articles(30)
@@ -539,7 +575,7 @@ def assess_macro_news_recession_score():
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO Free Logistics + PMI + Recession del dashboard funcionando",
+        "message": "Backend PRO Fixed Logistics + PMI + Recession del dashboard funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -552,7 +588,7 @@ def health():
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "blsKeyConfigured": bool(os.environ.get("BLS_API_KEY", "").strip()),
             "blsSeries": os.environ.get("BLS_SERIES", "CUUR0000SA0L1E"),
-            "version": "pro-free-logistics-pmi-recession-v1",
+            "version": "pro-free-logistics-pmi-recession-fix-v1",
         }
     })
 
@@ -585,7 +621,7 @@ def official_data():
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "blsKeyFromBackend": bool(os.environ.get("BLS_API_KEY", "").strip()),
                 "blsSeries": bls_series,
-                "version": "pro-free-logistics-pmi-recession-v1",
+                "version": "pro-free-logistics-pmi-recession-fix-v1",
             }
         }
 
