@@ -5,6 +5,7 @@ import urllib.request
 import csv
 import re
 import io
+import html
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -1998,6 +1999,253 @@ def assess_logistics_stress_from_news():
     }
 
 
+SPGLOBAL_PMI_HOME_URL = "https://www.pmi.spglobal.com/"
+SPGLOBAL_PMI_RELEASES_URL = "https://www.pmi.spglobal.com/public/release/pressreleases"
+
+PMI_MONTHS = {
+    "jan": "01", "january": "01", "ene": "01", "enero": "01",
+    "feb": "02", "february": "02", "febrero": "02",
+    "mar": "03", "march": "03", "marzo": "03",
+    "apr": "04", "april": "04", "abr": "04", "abril": "04",
+    "may": "05", "mayo": "05",
+    "jun": "06", "june": "06", "junio": "06",
+    "jul": "07", "july": "07", "julio": "07",
+    "aug": "08", "august": "08", "ago": "08", "agosto": "08",
+    "sep": "09", "sept": "09", "september": "09", "septiembre": "09",
+    "oct": "10", "october": "10", "octubre": "10",
+    "nov": "11", "november": "11", "noviembre": "11",
+    "dec": "12", "december": "12", "dic": "12", "diciembre": "12",
+}
+
+
+def clean_html_text(raw: str):
+    """Convert a small HTML document into compact searchable text."""
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw or "", flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def month_start_from_name(month_name: str, reference_date: datetime | None = None):
+    reference_date = reference_date or datetime.utcnow()
+    key = str(month_name or "").strip().lower().rstrip(".")
+    month = PMI_MONTHS.get(key[:3]) or PMI_MONTHS.get(key)
+    if not month:
+        return reference_date.strftime("%Y-%m-%d")
+
+    # Releases are usually published at the beginning of the following month.
+    year = reference_date.year
+    current_month = reference_date.month
+    month_number = int(month)
+    if month_number > current_month + 1:
+        year -= 1
+
+    return f"{year}-{month}-01"
+
+
+def extract_official_global_pmi_candidates(text: str):
+    """Extract PMI candidates from official S&P/J.P. Morgan text.
+
+    Conservative by design: if the official value cannot be parsed cleanly, the
+    dashboard falls back to news/proxy instead of showing a high-confidence wrong value.
+    """
+    compact = re.sub(r"\s+", " ", text or " ").strip()
+    candidates = []
+
+    patterns = [
+        ("spglobal_home_card", r"Global\s+COMPOSITE\s+OUTPUT\s+PMI\s+([A-Za-z]{3,9})\s*:?\s*(\d{1,2}(?:\.\d)?)"),
+        ("spglobal_home_card", r"Global\s+Composite\s+Output\s+PMI\s+([A-Za-z]{3,9})\s*:?\s*(\d{1,2}(?:\.\d)?)"),
+        ("official_release", r"J\.?P\.?\s*Morgan\s+Global\s+Composite\s+PMI\s+Output\s+Index.{0,220}?(?:rose|rises|increased|fell|falls|declined|dropped|eased|slipped|posted|registered|came\s+in|was|stood)\s+(?:to|at)?\s*(\d{1,2}(?:\.\d)?)"),
+        ("official_release", r"Global\s+Composite\s+PMI\s+Output\s+Index.{0,220}?(?:rose|rises|increased|fell|falls|declined|dropped|eased|slipped|posted|registered|came\s+in|was|stood)\s+(?:to|at)?\s*(\d{1,2}(?:\.\d)?)"),
+        ("official_release", r"Global\s+Composite\s+PMI.{0,160}?(?:rose|rises|increased|fell|falls|declined|dropped|eased|slipped|posted|registered|came\s+in|was|stood)\s+(?:to|at)?\s*(\d{1,2}(?:\.\d)?)"),
+    ]
+
+    for kind, pattern in patterns:
+        for match in re.finditer(pattern, compact, flags=re.IGNORECASE):
+            groups = match.groups()
+            if len(groups) == 2:
+                month_name, value_text = groups
+            else:
+                month_name, value_text = None, groups[0]
+
+            try:
+                value = float(value_text)
+            except (TypeError, ValueError):
+                continue
+
+            if 30 <= value <= 70:
+                start = max(0, match.start() - 120)
+                end = min(len(compact), match.end() + 160)
+                candidates.append({
+                    "value": round(value, 1),
+                    "month": month_name,
+                    "date": month_start_from_name(month_name) if month_name else datetime.utcnow().strftime("%Y-%m-%d"),
+                    "kind": kind,
+                    "context": compact[start:end],
+                })
+
+    return candidates
+
+
+def fetch_spglobal_global_pmi_homepage():
+    html_raw = fetch_text(SPGLOBAL_PMI_HOME_URL, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": SPGLOBAL_PMI_HOME_URL,
+    }, timeout=18)
+
+    text = clean_html_text(html_raw)
+    candidates = extract_official_global_pmi_candidates(text)
+    home_candidates = [c for c in candidates if c.get("kind") == "spglobal_home_card"] or candidates
+
+    if not home_candidates:
+        raise ValueError("No se pudo extraer Global Composite Output PMI desde la homepage oficial de S&P Global PMI")
+
+    chosen = home_candidates[0]
+    return {
+        "latest": chosen["value"],
+        "previous": None,
+        "date": chosen.get("date") or datetime.utcnow().strftime("%Y-%m-%d"),
+        "source": "S&P Global PMI official homepage",
+        "confidence": 0.88,
+        "summary": f"PMI global extraído desde la web oficial de S&P Global PMI: {chosen.get('month') or 'último dato'} {chosen['value']}.",
+        "articleCount": 1,
+        "sampleArticles": [{
+            "title": f"Global Composite Output PMI {chosen.get('month') or ''}: {chosen['value']}",
+            "domain": "pmi.spglobal.com",
+            "url": SPGLOBAL_PMI_HOME_URL,
+            "provider": "spglobal_official",
+        }],
+        "diagnostics": {"officialSource": "homepage", "context": chosen.get("context")},
+    }
+
+
+def discover_spglobal_global_pmi_release_urls(max_urls: int = 4):
+    html_raw = fetch_text(SPGLOBAL_PMI_RELEASES_URL, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": SPGLOBAL_PMI_HOME_URL,
+    }, timeout=18)
+
+    urls = []
+    for match in re.finditer(r'href=["\']([^"\']+)["\']', html_raw, flags=re.IGNORECASE):
+        href = html.unescape(match.group(1))
+        start = max(0, match.start() - 600)
+        end = min(len(html_raw), match.end() + 900)
+        window = clean_html_text(html_raw[start:end]).lower()
+        href_low = href.lower()
+
+        if (
+            ("pressrelease" in href_low or "release" in href_low)
+            and ("jpmorgan" in window or "j.p. morgan" in window or "global composite pmi" in window)
+        ):
+            full_url = urllib.parse.urljoin(SPGLOBAL_PMI_RELEASES_URL, href)
+            if full_url not in urls:
+                urls.append(full_url)
+
+        if len(urls) >= max_urls:
+            break
+
+    return urls
+
+
+def fetch_spglobal_global_pmi_release():
+    urls = discover_spglobal_global_pmi_release_urls(5)
+    errors = []
+
+    for url in urls:
+        try:
+            raw = fetch_text(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain,*/*;q=0.8",
+                "Referer": SPGLOBAL_PMI_RELEASES_URL,
+            }, timeout=18)
+            text = clean_html_text(raw)
+            candidates = extract_official_global_pmi_candidates(text)
+            if candidates:
+                chosen = candidates[0]
+                return {
+                    "latest": chosen["value"],
+                    "previous": None,
+                    "date": chosen.get("date") or datetime.utcnow().strftime("%Y-%m-%d"),
+                    "source": "S&P Global / J.P. Morgan official PMI release",
+                    "confidence": 0.92,
+                    "summary": f"PMI global extraído desde release oficial S&P Global/J.P. Morgan: {chosen['value']}.",
+                    "articleCount": 1,
+                    "sampleArticles": [{
+                        "title": f"J.P. Morgan Global Composite PMI official release: {chosen['value']}",
+                        "domain": "pmi.spglobal.com",
+                        "url": url,
+                        "provider": "spglobal_official_release",
+                    }],
+                    "diagnostics": {"officialSource": "press_release", "url": url, "context": chosen.get("context")},
+                }
+        except Exception as error:
+            errors.append(f"{url}: {error}")
+
+    raise ValueError("No se pudo extraer Global Composite PMI desde releases oficiales. " + " | ".join(errors[-3:]))
+
+
+def reconcile_official_pmi(home_result: dict | None, release_result: dict | None):
+    if home_result and release_result:
+        home_value = home_result.get("latest")
+        release_value = release_result.get("latest")
+        if home_value is not None and release_value is not None and abs(float(home_value) - float(release_value)) <= 0.15:
+            merged = dict(home_result)
+            merged["confidence"] = 0.95
+            merged["source"] = "S&P Global PMI official homepage + official release"
+            merged["summary"] = f"PMI global confirmado por homepage oficial y release S&P Global/J.P. Morgan: {round(float(home_value), 1)}."
+            merged["sampleArticles"] = (home_result.get("sampleArticles") or []) + (release_result.get("sampleArticles") or [])
+            merged["diagnostics"] = {
+                "officialSource": "homepage_and_release",
+                "homepage": home_result.get("diagnostics", {}),
+                "release": release_result.get("diagnostics", {}),
+            }
+            return merged
+
+        chosen = dict(release_result)
+        chosen["confidence"] = 0.85
+        chosen["summary"] = (
+            f"PMI global tomado del release oficial S&P Global/J.P. Morgan ({release_value}); "
+            f"la homepage devolvió {home_value}, por eso se reduce la confianza."
+        )
+        chosen["diagnostics"] = {
+            "officialSource": "release_preferred_due_to_mismatch",
+            "homepageLatest": home_value,
+            "releaseLatest": release_value,
+            "homepage": home_result.get("diagnostics", {}),
+            "release": release_result.get("diagnostics", {}),
+        }
+        return chosen
+
+    return home_result or release_result
+
+
+def fetch_official_global_pmi():
+    errors = []
+    home_result = None
+    release_result = None
+
+    try:
+        home_result = fetch_spglobal_global_pmi_homepage()
+    except Exception as error:
+        errors.append(f"S&P Global homepage: {error}")
+
+    try:
+        release_result = fetch_spglobal_global_pmi_release()
+    except Exception as error:
+        errors.append(f"S&P Global/J.P. Morgan release: {error}")
+
+    result = reconcile_official_pmi(home_result, release_result)
+    if result:
+        if errors:
+            result.setdefault("providerErrors", errors)
+        return result
+
+    raise ValueError("; ".join(errors) or "No se pudo extraer PMI global oficial")
+
+
 def fetch_gdelt_pmi_articles(max_records: int = 20):
     try:
         params = {
@@ -2021,18 +2269,20 @@ def fetch_gdelt_pmi_articles(max_records: int = 20):
                 "url": item.get("url", ""),
                 "seendate": item.get("seendate", ""),
                 "language": item.get("language", ""),
+                "provider": "gdelt",
             })
 
         return articles
     except Exception:
         return []
 
+
 def extract_pmi_value_from_text(text: str):
     patterns = [
-        r'(?:J\\.?P\\.?\\s?Morgan|JPMorgan).*?(?:Global Composite PMI|Global PMI|Composite PMI).*?(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|at|was|posted|registered|came in at)\\s+(\\d{1,2}(?:\\.\\d)?)',
-        r'(?:Global Composite PMI|Global PMI|Composite PMI).*?(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|at|was|posted|registered|came in at)\\s+(\\d{1,2}(?:\\.\\d)?)',
-        r'(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|posted|registered|came in at)\\s+(\\d{1,2}(?:\\.\\d)?).*?(?:Global Composite PMI|Global PMI|Composite PMI)',
-        r'\\b(\\d{1,2}(?:\\.\\d)?)\\b.*?(?:Global Composite PMI|Global PMI|Composite PMI)',
+        r'(?:J\.?P\.?\s?Morgan|JPMorgan).*?(?:Global Composite PMI|Global PMI|Composite PMI).*?(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|at|was|posted|registered|came in at)\s+(\d{1,2}(?:\.\d)?)',
+        r'(?:Global Composite PMI|Global PMI|Composite PMI).*?(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|at|was|posted|registered|came in at)\s+(\d{1,2}(?:\.\d)?)',
+        r'(?:rose to|rises to|increased to|up to|fell to|falls to|declined to|down to|posted|registered|came in at)\s+(\d{1,2}(?:\.\d)?).*?(?:Global Composite PMI|Global PMI|Composite PMI)',
+        r'\b(\d{1,2}(?:\.\d)?)\b.*?(?:Global Composite PMI|Global PMI|Composite PMI)',
     ]
 
     for pattern in patterns:
@@ -2044,7 +2294,15 @@ def extract_pmi_value_from_text(text: str):
 
     return None
 
+
 def assess_global_pmi_from_news():
+    official_errors = []
+
+    try:
+        return fetch_official_global_pmi()
+    except Exception as error:
+        official_errors.append(str(error))
+
     articles = fetch_gdelt_pmi_articles(20)
 
     candidates = []
@@ -2065,14 +2323,15 @@ def assess_global_pmi_from_news():
             "latest": None,
             "previous": None,
             "date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "source": "GDELT PMI news parser",
+            "source": "Official PMI parser + GDELT PMI news parser",
             "confidence": 0.0,
-            "summary": "No se pudo extraer automáticamente un valor de JPMorgan Global Composite PMI desde titulares recientes.",
+            "summary": "No se pudo extraer automáticamente un valor oficial o fiable de JPMorgan Global Composite PMI; se usará proxy macro si el endpoint principal puede calcularlo.",
             "articleCount": len(articles),
             "sampleArticles": articles[:6],
+            "providerErrors": official_errors,
+            "diagnostics": {"officialErrors": official_errors, "gdeltPmiArticles": len(articles)},
         }
 
-    # Preferimos el resultado más reciente que haya pasado validación.
     chosen = candidates[0]
 
     return {
@@ -2085,9 +2344,9 @@ def assess_global_pmi_from_news():
         "articleCount": len(articles),
         "sampleArticles": articles[:6],
         "matchedArticle": chosen,
+        "providerErrors": official_errors,
+        "diagnostics": {"officialErrors": official_errors, "gdeltPmiArticles": len(articles)},
     }
-
-
 def fetch_gdelt_macro_articles(max_records: int = 30):
     try:
         params = {
@@ -2346,12 +2605,12 @@ def official_data():
         try:
             pmi_candidate = out.pop("_pmiCandidate", None) or {}
             if pmi_candidate.get("latest") is not None:
-                pmi = stamp_update(pmi_candidate, calculation_date, "Calculado (GDELT PMI)")
+                pmi = stamp_update(pmi_candidate, calculation_date, "PMI official/news parser")
                 out["updates"]["globalPMI"] = pmi
                 out["globalPmiNews"] = pmi
                 out["messages"].append(
-                    f"PMI global estimado desde noticias: {pmi['latest']} "
-                    f"(confianza {round(float(pmi.get('confidence', 0)) * 100)}%)"
+                    f"PMI global actualizado: {pmi['latest']} "
+                    f"(fuente: {pmi.get('source', 'N/D')}, confianza {round(float(pmi.get('confidence', 0)) * 100)}%)"
                 )
             else:
                 proxy_row = {}
@@ -2365,9 +2624,11 @@ def official_data():
                     "previous": None,
                     "source": "Calculado (proxy macro)",
                     "confidence": 0.20,
-                    "summary": "No se extrajo un valor fiable de PMI global desde titulares; se usa proxy macro calculado con estrés financiero/oferta y desempleo.",
+                    "summary": "No se extrajo un valor fiable de PMI global desde fuentes oficiales ni titulares; se usa proxy macro calculado con estrés financiero/oferta y desempleo.",
                     "articleCount": pmi_candidate.get("articleCount", 0),
                     "sampleArticles": pmi_candidate.get("sampleArticles", []),
+                    "providerErrors": pmi_candidate.get("providerErrors", []),
+                    "diagnostics": pmi_candidate.get("diagnostics", {}),
                 }, calculation_date, "Calculado (proxy macro)")
                 out["updates"]["globalPMI"] = pmi
                 out["globalPmiNews"] = pmi
@@ -2443,9 +2704,9 @@ def global_pmi_news():
         today = datetime.utcnow().strftime("%Y-%m-%d")
         result = assess_global_pmi_from_news()
         if result.get("latest") is not None:
-            result = stamp_update(result, today, "Calculado (GDELT PMI)")
+            result = stamp_update(result, today, "PMI official/news parser")
         else:
-            result = stamp_update(result, today, "Calculado (GDELT PMI)")
+            result = stamp_update(result, today, "PMI official/news parser")
         return jsonify({"ok": True, "result": result})
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
