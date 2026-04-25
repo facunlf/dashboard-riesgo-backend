@@ -197,6 +197,49 @@ def normalize_provider_date(value):
         return text
     return datetime.utcnow().strftime("%Y-%m-%d")
 
+
+
+def clamp(value, min_value=0, max_value=100):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = min_value
+    return max(min_value, min(max_value, number))
+
+def num(row, key, fallback=0):
+    if row is None:
+        return fallback
+    value = row.get(key, fallback)
+    if value in (None, "", ".", "-"):
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+def month_key(date_text):
+    text = str(date_text or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return text
+    parsed = parse_date_like(text) or normalize_provider_date(text)
+    return str(parsed)[:7]
+
+def last_observation_per_month(observations):
+    by_month = {}
+    for obs in sorted(observations or [], key=lambda x: str(x.get("date", ""))):
+        if not isinstance(obs, dict):
+            continue
+        date = obs.get("date")
+        value = obs.get("value")
+        if date in (None, "") or value in (None, "", ".", "-"):
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        by_month[month_key(date)] = numeric
+    return by_month
+
 def fetch_gscpi_nyfed_history(start: str | None = None, end: str | None = None):
     last_error = None
     for url in GSCPI_DATA_URLS:
