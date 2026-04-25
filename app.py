@@ -7,11 +7,23 @@ import io
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+
+@app.after_request
+def add_cors_headers(response):
+    # Ensure even JSON error responses include CORS headers.
+    # If Render/Gunicorn kills the worker before Flask returns, those proxy errors
+    # can still appear as CORS in the browser; the route below is shortened to avoid that.
+    response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return response
 
 FRED_SERIES = {
     "brent": ("DCOILBRENTEU", "Brent"),
@@ -62,7 +74,7 @@ def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers:
 
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
 
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    with urllib.request.urlopen(req, timeout=12) as resp:
         raw = resp.read().decode("utf-8", errors="replace").strip()
 
         if not raw:
@@ -78,7 +90,7 @@ def fetch_binary(url: str, headers: dict | None = None):
     req_headers = headers or {}
     req_headers.setdefault("User-Agent", "macro-risk-dashboard/1.0")
     req = urllib.request.Request(url, headers=req_headers, method="GET")
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=15) as resp:
         raw = resp.read()
         if not raw:
             raise ValueError("Respuesta vacía del proveedor")
@@ -1087,6 +1099,15 @@ def health():
 
 @app.post("/api/official-data")
 def official_data():
+    """
+    Fast/robust refresh endpoint.
+
+    Previous version called many external providers sequentially. From Netlify that can
+    surface as a misleading CORS error when Render/Gunicorn times out before Flask
+    can return a response with CORS headers. This version runs external calls in
+    parallel, uses shorter provider timeouts and always returns partial results when
+    some providers fail.
+    """
     try:
         payload = request.get_json(force=True, silent=True) or {}
 
@@ -1103,85 +1124,146 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-pmi-recession-history-v7-complete-indicator-dates",
+                "version": "pro-free-logistics-pmi-recession-history-v8-fast-official-data",
             }
         }
 
-        if fred_key:
-            for key, (series, label) in FRED_SERIES.items():
+        def safe_latest_number(item):
+            if not isinstance(item, dict):
+                return None
+            value = item.get("latest")
+            if value in (None, "", ".", "-"):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def gscpi_job():
+            try:
+                return stamp_update(fetch_gscpi_latest(), calculation_date, "New York Fed GSCPI")
+            except Exception as first_error:
+                if fred_key:
+                    try:
+                        return stamp_update(fetch_fred_latest("GSCPI", fred_key), calculation_date, "FRED GSCPI")
+                    except Exception as second_error:
+                        raise ValueError(f"New York Fed: {first_error}; FRED fallback: {second_error}")
+                raise first_error
+
+        def core_job():
+            return stamp_update(fetch_fred_yoy_latest("PCEPILFE", fred_key), calculation_date, "FRED / BEA Core PCE")
+
+        def logistics_job():
+            return stamp_update(assess_logistics_stress_from_news(), calculation_date, "Calculado (GDELT/logística)")
+
+        def pmi_job():
+            return assess_global_pmi_from_news()
+
+        def macro_job():
+            return stamp_update(assess_macro_news_recession_score(), calculation_date, "Calculado (GDELT macro/recesión)")
+
+        jobs = {}
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            if fred_key:
+                for key, (series, label) in FRED_SERIES.items():
+                    future = executor.submit(
+                        lambda s=series: stamp_update(fetch_fred_latest(s, fred_key), calculation_date, f"FRED {s}")
+                    )
+                    jobs[future] = {"kind": "fred", "key": key, "label": label, "series": series}
+
+                future = executor.submit(core_job)
+                jobs[future] = {"kind": "core", "key": "coreInflation", "label": "Core PCE interanual"}
+            else:
+                out["messages"].append("FRED_API_KEY no está configurada en Render")
+                out["messages"].append("Core PCE no se actualizó porque FRED_API_KEY no está configurada")
+
+            future = executor.submit(gscpi_job)
+            jobs[future] = {"kind": "gscpi", "key": "gscpi", "label": "Global Supply Chain Pressure Index"}
+
+            future = executor.submit(logistics_job)
+            jobs[future] = {"kind": "logistics", "key": "shippingStress", "label": "Estrés logístico"}
+
+            future = executor.submit(pmi_job)
+            jobs[future] = {"kind": "pmi", "key": "globalPMI", "label": "PMI global"}
+
+            future = executor.submit(macro_job)
+            jobs[future] = {"kind": "macro", "key": "macroNewsRecession", "label": "Noticias macro/recesión"}
+
+            for future in as_completed(jobs):
+                meta = jobs[future]
+                kind = meta["kind"]
+                key = meta["key"]
+                label = meta["label"]
+
                 try:
-                    value = stamp_update(fetch_fred_latest(series, fred_key), calculation_date, f"FRED {series}")
-                    out["updates"][key] = value
-                    out["messages"].append(f"{label} actualizado ({value['date']})")
+                    result = future.result()
                 except Exception as error:
                     out["messages"].append(f"Error {label}: {error}")
+                    continue
 
-            try:
-                curve = stamp_update(fetch_fred_pair_spread("DGS10", "DGS2", fred_key), calculation_date, "FRED DGS10-DGS2")
-                out["updates"]["yieldCurve10y2y"] = curve
-                out["messages"].append(f"Curva 10Y-2Y actualizada ({curve['date']})")
-            except Exception as error:
-                out["messages"].append(f"Error curva 10Y-2Y: {error}")
+                if kind in ("fred", "gscpi", "core"):
+                    out["updates"][key] = result
+                    out["messages"].append(f"{label} actualizado ({result.get('date', calculation_date)})")
 
-        else:
-            out["messages"].append("FRED_API_KEY no está configurada en Render")
+                elif kind == "logistics":
+                    out["updates"]["shippingStress"] = result
+                    out["logisticsStressNews"] = result
+                    out["messages"].append(
+                        f"Estrés logístico estimado con noticias: {result.get('latest')}/100 "
+                        f"({result.get('level', 'N/D')}, confianza {round(float(result.get('confidence', 0)) * 100)}%)"
+                    )
 
+                elif kind == "pmi":
+                    # We may need official/FRED results to build the proxy, so store temporarily.
+                    out["_pmiCandidate"] = result
+
+                elif kind == "macro":
+                    out["macroRecessionNews"] = result
+                    out["updates"]["macroNewsRecession"] = result
+                    out["messages"].append(
+                        f"Noticias macro/recesión estimadas: {result.get('latest')}/100 "
+                        f"({result.get('level', 'N/D')}, confianza {round(float(result.get('confidence', 0)) * 100)}%)"
+                    )
+
+        # Curve 10Y-2Y can be computed from the two FRED updates already fetched,
+        # avoiding two extra network calls.
+        ten = out["updates"].get("tenYearYield")
+        two = out["updates"].get("twoYearYield")
+        ten_value = safe_latest_number(ten)
+        two_value = safe_latest_number(two)
+        if ten_value is not None and two_value is not None:
+            curve_date = max(str(ten.get("date", calculation_date))[:10], str(two.get("date", calculation_date))[:10])
+            curve = stamp_update({
+                "latest": round(ten_value - two_value, 3),
+                "previous": None,
+                "date": curve_date,
+                "series": "DGS10-DGS2",
+                "parts": {"DGS10": ten_value, "DGS2": two_value},
+            }, calculation_date, "FRED DGS10-DGS2")
+            out["updates"]["yieldCurve10y2y"] = curve
+            out["messages"].append(f"Curva 10Y-2Y actualizada ({curve['date']})")
+        elif fred_key:
+            out["messages"].append("Curva 10Y-2Y no se actualizó porque faltó DGS10 o DGS2")
+
+        # PMI: use extracted value when available; otherwise use proxy based on whatever
+        # providers succeeded. This prevents the endpoint from failing just because PMI
+        # cannot be parsed from headlines.
         try:
-            gscpi = stamp_update(fetch_gscpi_latest(), calculation_date, "New York Fed GSCPI")
-            out["updates"]["gscpi"] = gscpi
-            out["messages"].append(f"Global Supply Chain Pressure Index actualizado ({gscpi['date']})")
-        except Exception:
-            if fred_key:
-                try:
-                    gscpi = stamp_update(fetch_fred_latest("GSCPI", fred_key), calculation_date, "FRED GSCPI")
-                    out["updates"]["gscpi"] = gscpi
-                    out["messages"].append(f"Global Supply Chain Pressure Index actualizado ({gscpi['date']})")
-                except Exception:
-                    out["messages"].append("Global Supply Chain Pressure Index no se actualizó; se conserva el último valor cargado")
-            else:
-                out["messages"].append("Global Supply Chain Pressure Index no se actualizó; se conserva el último valor cargado")
-
-        if fred_key:
-            try:
-                core = stamp_update(fetch_fred_yoy_latest("PCEPILFE", fred_key), calculation_date, "FRED / BEA Core PCE")
-                out["updates"]["coreInflation"] = core
-                out["messages"].append(f"Core PCE interanual actualizado ({core['date']})")
-            except Exception as error:
-                out["messages"].append(f"Core PCE no se actualizó desde FRED/BEA: {error}")
-        else:
-            out["messages"].append("Core PCE no se actualizó porque FRED_API_KEY no está configurada")
-
-        try:
-            logistics = stamp_update(assess_logistics_stress_from_news(), calculation_date, "Calculado (GDELT/logística)")
-            out["updates"]["shippingStress"] = logistics
-            out["logisticsStressNews"] = logistics
-            out["messages"].append(
-                f"Estrés logístico estimado con noticias: {logistics['latest']}/100 "
-                f"({logistics['level']}, confianza {round(logistics['confidence'] * 100)}%)"
-            )
-        except Exception:
-            out["messages"].append("Estrés logístico por noticias no se actualizó; se conserva el último valor cargado")
-
-        try:
-            pmi = assess_global_pmi_from_news()
-            if pmi.get("latest") is not None:
-                pmi = stamp_update(pmi, calculation_date, "Calculado (GDELT PMI)")
+            pmi_candidate = out.pop("_pmiCandidate", None) or {}
+            if pmi_candidate.get("latest") is not None:
+                pmi = stamp_update(pmi_candidate, calculation_date, "Calculado (GDELT PMI)")
                 out["updates"]["globalPMI"] = pmi
                 out["globalPmiNews"] = pmi
                 out["messages"].append(
                     f"PMI global estimado desde noticias: {pmi['latest']} "
-                    f"(confianza {round(pmi.get('confidence', 0) * 100)}%)"
+                    f"(confianza {round(float(pmi.get('confidence', 0)) * 100)}%)"
                 )
             else:
-                # Si no se puede extraer un PMI textual fiable, igualmente devolvemos una fecha de cálculo
-                # y un proxy macro para que el indicador no quede sin fecha ni sin actualización.
                 proxy_row = {}
-                for key, item in out["updates"].items():
-                    if isinstance(item, dict) and item.get("latest") not in (None, "", ".", "-"):
-                        try:
-                            proxy_row[key] = float(item["latest"])
-                        except (TypeError, ValueError):
-                            pass
+                for k, item in out["updates"].items():
+                    value = safe_latest_number(item)
+                    if value is not None:
+                        proxy_row[k] = value
                 proxy_value = global_pmi_proxy(proxy_row)
                 pmi = stamp_update({
                     "latest": proxy_value,
@@ -1189,37 +1271,22 @@ def official_data():
                     "source": "Calculado (proxy macro)",
                     "confidence": 0.20,
                     "summary": "No se extrajo un valor fiable de PMI global desde titulares; se usa proxy macro calculado con estrés financiero/oferta y desempleo.",
-                    "articleCount": pmi.get("articleCount", 0),
-                    "sampleArticles": pmi.get("sampleArticles", []),
+                    "articleCount": pmi_candidate.get("articleCount", 0),
+                    "sampleArticles": pmi_candidate.get("sampleArticles", []),
                 }, calculation_date, "Calculado (proxy macro)")
                 out["updates"]["globalPMI"] = pmi
                 out["globalPmiNews"] = pmi
                 out["messages"].append(f"PMI global calculado por proxy macro: {proxy_value} ({calculation_date})")
         except Exception as error:
-            out["messages"].append(f"Error PMI global por noticias: {error}")
+            out["messages"].append(f"Error PMI global/proxy: {error}")
 
-        try:
-            macro_news = stamp_update(assess_macro_news_recession_score(), calculation_date, "Calculado (GDELT macro/recesión)")
-            out["macroRecessionNews"] = macro_news
-            out["updates"]["macroNewsRecession"] = macro_news
-            out["messages"].append(
-                f"Noticias macro/recesión estimadas: {macro_news['latest']}/100 "
-                f"({macro_news['level']}, confianza {round(macro_news['confidence'] * 100)}%)"
-            )
-        except Exception as error:
-            out["messages"].append(f"Error noticias macro/recesión: {error}")
-
-        # Fechas y valores calculados por indicador.
-        # El frontend también recalcula, pero enviar estos campos evita que los indicadores
-        # calculados queden sin fecha visible tras una actualización automática.
+        # Calculated indicators with explicit data and calculation dates.
         try:
             row = {}
             for key, item in out["updates"].items():
-                if isinstance(item, dict) and item.get("latest") not in (None, "", ".", "-"):
-                    try:
-                        row[key] = float(item["latest"])
-                    except (TypeError, ValueError):
-                        pass
+                value = safe_latest_number(item)
+                if value is not None:
+                    row[key] = value
 
             if row:
                 row["supplyStress"] = supply_stress_value(row)
@@ -1255,6 +1322,16 @@ def official_data():
 
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
+
+
+@app.post("/api/official-data-lite")
+def official_data_lite():
+    """Tiny POST endpoint to verify POST+CORS from Netlify without external providers."""
+    return jsonify({
+        "ok": True,
+        "message": "POST/CORS OK",
+        "date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
 
 @app.post("/api/logistics-stress-news")
 def logistics_stress_news():
