@@ -1,4 +1,4 @@
-Backend PRO + Supply Stress listo para Render.
+Backend PRO + Históricos listo para Render.
 
 ARCHIVOS:
 - app.py
@@ -16,19 +16,10 @@ FRED_API_KEY = tu clave de FRED
 BLS_API_KEY = tu clave de BLS, opcional
 BLS_SERIES = CUUR0000SA0L1E
 
-INDICADORES AUTOMÁTICOS:
-- Brent: DCOILBRENTEU
-- High Yield OAS: BAMLH0A0HYM2
-- VIX: VIXCLS
-- USD trade weighted: DTWEXBGS
-- 10Y yield: DGS10
-- 2Y yield: DGS2
-- Curva 10Y-2Y: DGS10 - DGS2
-- 10Y breakeven inflation: T10YIE
-- 10Y real yield: DFII10
-- Unemployment: UNRATE
-- GSCPI / Global Supply Chain Pressure Index: GSCPI
-- Core CPI YoY: BLS CUUR0000SA0L1E
+ENDPOINTS:
+GET /health
+POST /api/official-data
+POST /api/history
 
-SUPPLY STRESS:
-El frontend lo calcula automáticamente combinando Brent + GSCPI + Estrés logístico.
+NUEVO:
+POST /api/history permite descargar históricos mensuales desde 2003 o el rango que indiques.
