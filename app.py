@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v14-currency-availability-glossary",
+        "version": "pro-free-logistics-dynamic-multisource-v15-assets-recession-confidence",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -57,6 +57,9 @@ FRED_SERIES = {
     "tenYearBreakeven": ("T10YIE", "Inflation breakeven 10Y"),
     "realYield10y": ("DFII10", "Real yield 10Y"),
     "unemployment": ("UNRATE", "Unemployment"),
+    "sahmRule": ("SAHMREALTIME", "Sahm Rule recession indicator"),
+    "smoothedRecessionProbability": ("RECPROUSM156N", "Smoothed recession probability"),
+    "initialClaims": ("ICSA", "Initial unemployment claims"),
 }
 
 LOGISTICS_QUERY = (
@@ -1045,6 +1048,69 @@ def unemployment_stress_value(row):
 def pmi_stress_value(row):
     return score_inverse(num(row, "globalPMI", 52), 52, 45)
 
+def sahm_rule_stress_value(row):
+    # Sahm Rule signals recession onset near 0.50 pp. Score to 100 by 0.75 pp.
+    value = num(row, "sahmRule", None)
+    if value is None:
+        return None
+    return score_range(value, 0.0, 0.75)
+
+def smoothed_recession_probability_stress_value(row):
+    # FRED RECPROUSM156N already comes as a probability-like percentage.
+    value = num(row, "smoothedRecessionProbability", None)
+    if value is None:
+        return None
+    return clamp(value)
+
+def initial_claims_stress_value(row):
+    value = num(row, "initialClaims", None)
+    if value is None:
+        return None
+    # Weekly initial claims: roughly 200k benign, 350k+ stress.
+    return score_range(value, 200000, 350000)
+
+def recession_risk_confidence(row, pmi_source: str | None = None, provider_errors: list | None = None):
+    """
+    Confidence measures data coverage/freshness/source quality, not the probability itself.
+    With official FRED/NY Fed signals available, confidence can exceed 85% even if the risk score is moderate.
+    """
+    checks = [
+        ("Curva 10Y-2Y", "yieldCurve10y2y", 0.14),
+        ("Desempleo USA", "unemployment", 0.12),
+        ("HY OAS", "creditSpreads", 0.12),
+        ("VIX", "vix", 0.08),
+        ("PMI global", "globalPMI", 0.10),
+        ("Sahm Rule", "sahmRule", 0.12),
+        ("Probabilidad suavizada de recesión", "smoothedRecessionProbability", 0.12),
+        ("Initial Claims", "initialClaims", 0.08),
+        ("Noticias macro/GDELT", "macroNewsRecession", 0.06),
+        ("Supply/Shipping stress", "supplyStress", 0.06),
+    ]
+    available = []
+    missing = []
+    score = 0.0
+    for label, key, weight in checks:
+        value = row.get(key)
+        if value not in (None, "", ".", "-"):
+            score += weight
+            available.append(label)
+        else:
+            missing.append(label)
+
+    source_text = str(pmi_source or row.get("pmiSource") or "").lower()
+    if "proxy" in source_text or "calculado" in source_text:
+        score -= 0.04
+    if provider_errors:
+        score -= min(0.04, 0.01 * len(provider_errors))
+
+    confidence = clamp(score * 100, 0, 92) / 100
+    label = "Alta" if confidence >= 0.85 else "Media" if confidence >= 0.65 else "Baja"
+    explanation = (
+        f"Cobertura oficial: {', '.join(available[:7])}"
+        + (f". Faltan: {', '.join(missing[:4])}" if missing else ".")
+    )
+    return round(confidence, 2), label, explanation
+
 def historical_shipping_stress(row):
     """
     Proxy histórico calculado con datos oficiales disponibles.
@@ -1098,15 +1164,36 @@ def recession_risk_value(row):
         row["globalPMI"] = global_pmi_proxy(row)
 
     macro_news_proxy = clamp(num(row, "macroNewsRecession", 0) or (num(row, "supplyStress", supply_stress_value(row)) * 0.6 + num(row, "shippingStress", historical_shipping_stress(row)) * 0.4))
+    sahm = sahm_rule_stress_value(row)
+    smoothed = smoothed_recession_probability_stress_value(row)
+    claims = initial_claims_stress_value(row)
 
-    return round(
-        curve_stress_value(row) * 0.25
-        + unemployment_stress_value(row) * 0.20
-        + credit_stress_value(row) * 0.20
-        + vix_stress_value(row) * 0.10
-        + pmi_stress_value(row) * 0.15
-        + macro_news_proxy * 0.10
-    )
+    # Professional composite: hard official signals carry most weight; news is a small confirming layer.
+    weighted = [
+        (curve_stress_value(row), 0.18),
+        (unemployment_stress_value(row), 0.14),
+        (credit_stress_value(row), 0.16),
+        (vix_stress_value(row), 0.08),
+        (pmi_stress_value(row), 0.12),
+        (macro_news_proxy, 0.06),
+    ]
+    if sahm is not None:
+        weighted.append((sahm, 0.12))
+    else:
+        weighted[1] = (weighted[1][0], weighted[1][1] + 0.06)
+        weighted[5] = (weighted[5][0], weighted[5][1] + 0.06)
+    if smoothed is not None:
+        weighted.append((smoothed, 0.10))
+    else:
+        weighted[0] = (weighted[0][0], weighted[0][1] + 0.05)
+        weighted[2] = (weighted[2][0], weighted[2][1] + 0.05)
+    if claims is not None:
+        weighted.append((claims, 0.04))
+    else:
+        weighted[1] = (weighted[1][0], weighted[1][1] + 0.04)
+
+    total_weight = sum(w for _v, w in weighted) or 1
+    return round(sum(float(v) * w for v, w in weighted) / total_weight)
 
 def status_for_value(key, value):
     v = float(value)
@@ -3275,7 +3362,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v14-currency-availability-glossary",
+            "version": "pro-free-logistics-dynamic-multisource-v15-assets-recession-confidence",
         }
     })
 
@@ -3306,7 +3393,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v14-currency-availability-glossary",
+                "version": "pro-free-logistics-dynamic-multisource-v15-assets-recession-confidence",
             }
         }
 
@@ -3474,10 +3561,17 @@ def official_data():
 
             if row:
                 row["supplyStress"] = supply_stress_value(row)
+                pmi_meta = out.get("globalPmiNews") or out["updates"].get("globalPMI") or {}
+                row["pmiSource"] = pmi_meta.get("source") if isinstance(pmi_meta, dict) else None
                 row["recessionRisk"] = recession_risk_value(row)
+                recession_confidence, recession_confidence_label, recession_confidence_explanation = recession_risk_confidence(
+                    row,
+                    pmi_source=row.get("pmiSource"),
+                    provider_errors=(pmi_meta.get("providerErrors", []) if isinstance(pmi_meta, dict) else []),
+                )
 
                 supply_date = max_update_date(out["updates"], ["brent", "gscpi", "shippingStress"])
-                recession_date = max_update_date(out["updates"], ["yieldCurve10y2y", "unemployment", "creditSpreads", "vix", "globalPMI", "macroNewsRecession"])
+                recession_date = max_update_date(out["updates"], ["yieldCurve10y2y", "unemployment", "creditSpreads", "vix", "globalPMI", "macroNewsRecession", "sahmRule", "smoothedRecessionProbability", "initialClaims"])
 
                 out["updates"]["supplyStress"] = {
                     "latest": row["supplyStress"],
@@ -3497,7 +3591,21 @@ def official_data():
                     "calculatedAt": calculation_date,
                     "fetchedAt": calculation_date,
                     "source": "Calculado",
-                    "formula": "25% curva + 20% desempleo + 20% HY OAS + 10% VIX + 15% PMI + 10% noticias macro",
+                    "formula": "Modelo compuesto: curva, empleo, crédito, VIX, PMI, Sahm Rule, probabilidad suavizada FRED, claims y noticias macro",
+                    "confidence": recession_confidence,
+                    "confidenceLabel": recession_confidence_label,
+                    "confidenceExplanation": recession_confidence_explanation,
+                    "components": {
+                        "curveStress": round(curve_stress_value(row), 1),
+                        "unemploymentStress": round(unemployment_stress_value(row), 1),
+                        "creditStress": round(credit_stress_value(row), 1),
+                        "vixStress": round(vix_stress_value(row), 1),
+                        "pmiStress": round(pmi_stress_value(row), 1),
+                        "sahmRuleStress": None if sahm_rule_stress_value(row) is None else round(sahm_rule_stress_value(row), 1),
+                        "smoothedRecessionProbability": None if smoothed_recession_probability_stress_value(row) is None else round(smoothed_recession_probability_stress_value(row), 1),
+                        "initialClaimsStress": None if initial_claims_stress_value(row) is None else round(initial_claims_stress_value(row), 1),
+                        "macroNewsStress": round(clamp(num(row, "macroNewsRecession", 0)), 1),
+                    },
                 }
         except Exception as error:
             out["messages"].append(f"Indicadores calculados sin fecha backend: {error}")
