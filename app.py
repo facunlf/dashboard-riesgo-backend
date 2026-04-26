@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v13-get-currency-gscpi",
+        "version": "pro-free-logistics-dynamic-multisource-v14-currency-availability-glossary",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -2970,6 +2970,13 @@ CURRENCY_DOMINANCE_WEIGHTS = {
 }
 
 CURRENCY_DOMINANCE_CACHE = {"key": None, "created_at": None, "payload": None}
+CURRENCY_DOMINANCE_EARLIEST_DATE = "1999-01-01"
+CURRENCY_DOMINANCE_EARLIEST_MONTH = "1999-01"
+CURRENCY_DOMINANCE_AVAILABILITY_NOTE = (
+    "La serie comparable de dominancia monetaria empieza en 1999-01. "
+    "Aunque existen datos parciales anteriores de reservas/FX, el score de esta pestaña compara USD, EUR, CNY, JPY, GBP y otras monedas bajo una estructura moderna; antes de 1999 el euro no existía como moneda única y varias dimensiones no tienen cobertura homogénea."
+)
+
 
 
 def quarter_key_from_date(value: str):
@@ -3029,6 +3036,17 @@ def quarterly_range(start: str, end: str):
     if end_idx < start_idx:
         start_idx, end_idx = end_idx, start_idx
     return [index_to_quarter(idx) for idx in range(start_idx, end_idx + 1)]
+
+
+def clamp_currency_dominance_range(start: str, end: str):
+    """Clamp requested range to the first comparable period supported by this model."""
+    requested_start = str(start or CURRENCY_DOMINANCE_EARLIEST_DATE)[:10]
+    requested_end = str(end or datetime.now().strftime("%Y-%m-%d"))[:10]
+    clamped_start = max(requested_start, CURRENCY_DOMINANCE_EARLIEST_DATE)
+    if requested_end < clamped_start:
+        requested_end = clamped_start
+    was_clamped = clamped_start != requested_start
+    return clamped_start, requested_end, was_clamped
 
 
 def interpolate_anchor(anchors, year_fraction: float):
@@ -3200,13 +3218,30 @@ def summarize_currency_dominance(rows):
 
 
 def currency_dominance_payload(start: str, end: str):
+    start, end, was_clamped = clamp_currency_dominance_range(start, end)
     rows = build_currency_dominance_history(start, end)
     latest = rows[-1] if rows else None
+    warnings = [
+        "IMF COFER publica agregados globales: los datos por país sobre composición de reservas son confidenciales.",
+        "SWIFT y World Gold Council publican reportes/descargas, pero no siempre una API JSON estable; el endpoint incluye fallback documentado para mantener la pestaña operativa.",
+        "El oro se separa del score de monedas porque es activo de reserva, no moneda de pago/financiación internacional.",
+    ]
+    if was_clamped:
+        warnings.insert(
+            0,
+            "El rango solicitado empezaba antes de 1999-01; se ajustó automáticamente al primer período comparable disponible para esta pestaña."
+        )
     return {
         "ok": True,
         "start": start,
         "end": end,
         "frequency": "quarterly",
+        "dataAvailability": {
+            "earliestDate": CURRENCY_DOMINANCE_EARLIEST_DATE,
+            "earliestMonth": CURRENCY_DOMINANCE_EARLIEST_MONTH,
+            "latestMonth": quarter_to_month(quarter_key_from_date(end)),
+            "note": CURRENCY_DOMINANCE_AVAILABILITY_NOTE,
+        },
         "rows": rows,
         "count": len(rows),
         "latest": latest,
@@ -3214,11 +3249,7 @@ def currency_dominance_payload(start: str, end: str):
         "currencies": [{"key": key, "label": CURRENCY_LABELS[key]} for key in CURRENCY_KEYS],
         "summary": summarize_currency_dominance(rows),
         "quality": "official-public-plus-documented-fallback",
-        "warnings": [
-            "IMF COFER publica agregados globales: los datos por país sobre composición de reservas son confidenciales.",
-            "SWIFT y World Gold Council publican reportes/descargas, pero no siempre una API JSON estable; el endpoint incluye fallback documentado para mantener la pestaña operativa.",
-            "El oro se separa del score de monedas porque es activo de reserva, no moneda de pago/financiación internacional.",
-        ],
+        "warnings": warnings,
         "sources": [
             {"name": "IMF COFER", "url": "https://data.imf.org/en/datasets/IMF.STA:COFER", "use": "Reservas oficiales globales por moneda"},
             {"name": "BIS Triennial Central Bank Survey", "url": "https://data.bis.org/topics/DER", "use": "Uso por moneda en mercados FX globales"},
@@ -3226,6 +3257,7 @@ def currency_dominance_payload(start: str, end: str):
             {"name": "World Gold Council Goldhub", "url": "https://www.gold.org/goldhub/data/gold-reserves-by-country", "use": "Reservas oficiales de oro"},
         ],
     }
+
 
 @app.get("/")
 def index():
@@ -3243,7 +3275,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v13-get-currency-gscpi",
+            "version": "pro-free-logistics-dynamic-multisource-v14-currency-availability-glossary",
         }
     })
 
@@ -3274,7 +3306,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v13-get-currency-gscpi",
+                "version": "pro-free-logistics-dynamic-multisource-v14-currency-availability-glossary",
             }
         }
 
@@ -3547,7 +3579,8 @@ def currency_dominance():
         payload = request.get_json(force=True, silent=True) or {}
         start = str(request.args.get("start") or payload.get("start") or "1999-01-01")
         end = str(request.args.get("end") or payload.get("end") or datetime.now().strftime("%Y-%m-%d"))
-        cache_key = f"{quarter_key_from_date(start)}:{quarter_key_from_date(end)}"
+        clamped_start, clamped_end, _ = clamp_currency_dominance_range(start, end)
+        cache_key = f"{quarter_key_from_date(clamped_start)}:{quarter_key_from_date(clamped_end)}"
         now = datetime.utcnow()
         cached_at = CURRENCY_DOMINANCE_CACHE.get("created_at")
         if (
