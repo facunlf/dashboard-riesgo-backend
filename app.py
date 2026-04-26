@@ -92,7 +92,8 @@ def fetch_json(url: str, method: str = "GET", body: dict | None = None, headers:
 def fetch_binary(url: str, headers: dict | None = None, timeout: int = 15):
     req_headers = dict(headers or {})
     req_headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 macro-risk-dashboard/1.0")
-    req_headers.setdefault("Accept", "text/csv,application/json,text/plain,text/html,*/*")
+    req_headers.setdefault("Accept", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,application/json,text/plain,text/html,*/*")
+    req_headers.setdefault("Referer", "https://www.newyorkfed.org/research/policy/gscpi")
     req_headers.setdefault("Accept-Language", "en-US,en;q=0.9,es;q=0.8")
     req = urllib.request.Request(url, headers=req_headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -275,10 +276,10 @@ def parse_date_like(value):
     text = str(value).strip()
     if not text:
         return None
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-        return text
-    if re.fullmatch(r"\d{4}-\d{2}", text):
-        return text + "-01"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", text):
+        return text[:10]
+    if re.fullmatch(r"\d{4}-\d{2}.*", text):
+        return text[:7] + "-01"
     for fmt in ("%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%b-%y", "%b %Y", "%B %Y", "%Y-%m"):
         try:
             return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
@@ -412,75 +413,121 @@ def last_observation_per_month(observations):
         by_month[month_key(date)] = numeric
     return by_month
 
+def header_date_columns(row):
+    cols = []
+    for c, cell in enumerate(row):
+        text = str(cell or "").strip().lower()
+        if not text:
+            continue
+        if text in {"date", "dates", "month", "months", "observation date"} or "date" in text or "month" in text:
+            cols.append(c)
+    return cols
+
+
+def header_gscpi_columns(row):
+    cols = []
+    for c, cell in enumerate(row):
+        text = str(cell or "").strip().lower()
+        if not text:
+            continue
+        if "gscpi" in text or "global supply chain pressure" in text or "supply chain pressure index" in text:
+            cols.append(c)
+    return cols
+
+
+def score_gscpi_columns(rows, date_col, value_col, start_idx=0):
+    observations = []
+    for row in rows[start_idx:]:
+        if not row or max(date_col, value_col) >= len(row):
+            continue
+        parsed_date = parse_date_like(row[date_col])
+        numeric = parse_float_like(row[value_col])
+        if parsed_date and numeric is not None and -10 <= numeric <= 10:
+            observations.append({"date": parsed_date, "value": round(numeric, 4)})
+    return len(observations), observations
+
+
+def extract_gscpi_observations_from_sheet(rows):
+    """Extract NY Fed GSCPI monthly observations from one XLSX sheet.
+
+    The official workbook has changed layout over time. Older parsers could pick the
+    title cell containing "GSCPI" and the date column as the same column, producing
+    zero observations. This routine validates candidate column pairs by actually
+    counting parseable date/value rows, then keeps the best pair.
+    """
+    if not rows:
+        return []
+
+    candidates = []
+
+    # Prefer explicit header rows where date/month and GSCPI columns appear on the
+    # same row, and never in the same column.
+    for idx, row in enumerate(rows[:120]):
+        date_cols = header_date_columns(row)
+        value_cols = header_gscpi_columns(row)
+        for dc in date_cols:
+            for vc in value_cols:
+                if dc == vc:
+                    continue
+                score, obs = score_gscpi_columns(rows, dc, vc, idx + 1)
+                candidates.append((score, obs, "header", idx, dc, vc))
+
+    # Fallback: infer the column pair by data shape. A valid pair must have many rows
+    # where one column parses as a date and the other as a small numeric GSCPI value.
+    max_cols = min(20, max((len(row) for row in rows), default=0))
+    for dc in range(max_cols):
+        for vc in range(max_cols):
+            if dc == vc:
+                continue
+            score, obs = score_gscpi_columns(rows, dc, vc, 0)
+            if score:
+                candidates.append((score, obs, "inferred", 0, dc, vc))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_obs, *_ = candidates[0]
+    if best_score < 3:
+        return []
+
+    deduped = {}
+    for obs in best_obs:
+        deduped[obs["date"]] = obs
+    return [deduped[k] for k in sorted(deduped)]
+
+
 def fetch_gscpi_nyfed_history(start: str | None = None, end: str | None = None):
+    start_key = str(start or "")[:10] if start else None
+    end_key = str(end or "")[:10] if end else None
     last_error = None
+
     for url in GSCPI_DATA_URLS:
         try:
-            raw = fetch_binary(url)
+            raw = fetch_binary(url, timeout=25)
             sheets = parse_xlsx_rows(raw)
             observations = []
 
             for rows in sheets:
-                header_idx = None
-                date_col = None
-                value_col = None
+                observations.extend(extract_gscpi_observations_from_sheet(rows))
 
-                for idx, row in enumerate(rows[:80]):
-                    lowered = [str(x).strip().lower() for x in row]
-                    for c, cell in enumerate(lowered):
-                        if "date" in cell or "month" in cell:
-                            date_col = c
-                        if "gscpi" in cell or "global supply chain pressure" in cell:
-                            value_col = c
-                    if date_col is not None and value_col is not None:
-                        header_idx = idx
-                        break
-
-                if header_idx is not None:
-                    data_rows = rows[header_idx + 1:]
-                else:
-                    data_rows = rows
-
-                for row in data_rows:
-                    if not row:
-                        continue
-
-                    if date_col is not None and value_col is not None and max(date_col, value_col) < len(row):
-                        date_value = row[date_col]
-                        gscpi_value = row[value_col]
-                    else:
-                        parsed = [(i, parse_date_like(v)) for i, v in enumerate(row)]
-                        parsed = [(i, d) for i, d in parsed if d]
-                        if not parsed:
-                            continue
-                        date_i, parsed_date = parsed[0]
-                        numeric_candidates = [parse_float_like(v) for i, v in enumerate(row) if i != date_i]
-                        numeric_candidates = [v for v in numeric_candidates if v is not None and -10 <= v <= 10]
-                        if not numeric_candidates:
-                            continue
-                        date_value = parsed_date
-                        gscpi_value = numeric_candidates[0]
-
-                    parsed_date = parse_date_like(date_value)
-                    numeric = parse_float_like(gscpi_value)
-                    if parsed_date and numeric is not None and -10 <= numeric <= 10:
-                        if start and parsed_date < start:
-                            continue
-                        if end and parsed_date > end:
-                            continue
-                        observations.append({"date": parsed_date, "value": round(numeric, 4)})
-
-            observations.sort(key=lambda x: x["date"])
-            # de-duplicate same date if workbook contains chart/helper sheets
             deduped = {}
             for obs in observations:
-                deduped[obs["date"]] = obs
-            observations = list(deduped.values())
-            observations.sort(key=lambda x: x["date"])
+                parsed_date = obs.get("date")
+                numeric = parse_float_like(obs.get("value"))
+                if not parsed_date or numeric is None or not (-10 <= numeric <= 10):
+                    continue
+                if start_key and parsed_date < start_key:
+                    continue
+                if end_key and parsed_date > end_key:
+                    continue
+                deduped[parsed_date] = {"date": parsed_date, "value": round(numeric, 4)}
 
+            observations = [deduped[k] for k in sorted(deduped)]
             if observations:
                 return observations
-            last_error = ValueError("El archivo oficial de GSCPI no contenía observaciones legibles")
+
+            last_error = ValueError("El archivo oficial de GSCPI se descargó, pero no se encontraron columnas fecha/GSCPI con observaciones legibles")
         except Exception as error:
             last_error = error
 
@@ -911,21 +958,32 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
         except Exception:
             pass
 
+    gscpi_loaded = False
+    gscpi_errors = []
+
     try:
         gscpi_obs = fetch_gscpi_nyfed_history(start, end)
         by_month = last_observation_per_month(gscpi_obs)
         for date_key, value in by_month.items():
             monthly.setdefault(date_key, {"date": date_key})
             monthly[date_key]["gscpi"] = round(value, 4)
-    except Exception:
+        gscpi_loaded = bool(by_month)
+    except Exception as error:
+        gscpi_errors.append(f"GSCPI NY Fed histórico no se pudo cargar: {error}")
+
         try:
             gscpi_obs = fred_observations("GSCPI", fred_key, start, end)
             by_month = last_observation_per_month(gscpi_obs)
             for date_key, value in by_month.items():
                 monthly.setdefault(date_key, {"date": date_key})
                 monthly[date_key]["gscpi"] = round(value, 4)
-        except Exception:
-            pass
+            gscpi_loaded = bool(by_month)
+        except Exception as fred_error:
+            gscpi_errors.append(f"GSCPI fallback FRED no se pudo cargar: {fred_error}")
+
+    if not gscpi_loaded:
+        warnings.extend(gscpi_errors)
+        warnings.append("GSCPI histórico no se completó. GSCPI es dato obtenido de NY Fed; si sólo aparece el mes actual, revisar conectividad del backend con el archivo gscpi_data.xlsx.")
 
     try:
         dgs10 = last_observation_per_month(fred_observations("DGS10", fred_key, start, end))
@@ -1668,6 +1726,114 @@ def logistics_level(score):
 
     return "bajo"
 
+
+LOGISTICS_MAIN_SITUATION_RULES = [
+    {
+        "key": "hormuz",
+        "label": "Tensión en el Estrecho de Ormuz",
+        "summary": "el estrés se concentra en riesgos sobre petroleros, tráfico marítimo y prima de riesgo energética en una ruta crítica para el petróleo.",
+        "query_names": {"hormuz_crisis", "hormuz_traffic", "hormuz_normalization"},
+        "terms": ["hormuz", "strait of hormuz"],
+    },
+    {
+        "key": "red_sea",
+        "label": "Tensión en Mar Rojo/Bab el-Mandeb",
+        "summary": "el estrés se concentra en ataques, amenazas a buques, desvíos de navieras o incremento del riesgo de asegurar esa ruta.",
+        "query_names": {"red_sea_crisis", "ukmto_incidents"},
+        "terms": ["red sea", "bab el-mandeb", "houthi", "houthis", "gulf of aden", "ukmto"],
+    },
+    {
+        "key": "suez",
+        "label": "Presión sobre la ruta Suez/Cabo de Buena Esperanza",
+        "summary": "el estrés se concentra en desvíos, retrasos, congestión o mayor tiempo/coste de transporte en rutas comerciales clave.",
+        "query_names": {"suez_shipping"},
+        "terms": ["suez", "suez canal", "cape of good hope"],
+    },
+    {
+        "key": "freight_insurance",
+        "label": "Aumento de costes logísticos y seguros marítimos",
+        "summary": "el estrés se concentra en fletes, seguros de guerra, primas marítimas, congestión portuaria o desvíos de rutas.",
+        "query_names": {"freight_insurance", "carrier_routes"},
+        "terms": ["war risk", "war-risk", "insurance", "freight rates", "shipping costs", "port congestion", "route diversion", "rerouting"],
+    },
+    {
+        "key": "normalization",
+        "label": "Normalización operativa de rutas",
+        "summary": "las noticias apuntan a reapertura, tráfico retomándose, navieras volviendo a rutas o costes de seguro/flete bajando.",
+        "query_names": {"normalization", "hormuz_normalization"},
+        "terms": ["reopened", "re-opened", "fully open", "shipping resumes", "traffic resumes", "normal traffic", "routes restored", "blockade lifted", "insurance rates fall", "freight rates fall"],
+    },
+]
+
+
+def infer_logistics_main_situation(articles, drivers=None, diagnostics=None, score=None, level=None):
+    """Return a concise Spanish explanation of the dominant situation behind the logistics stress score."""
+    diagnostics = diagnostics or {}
+    drivers = drivers or []
+    score = 0 if score is None else float(score)
+    level = level or logistics_level(score)
+
+    fallback = diagnostics.get("fallback")
+    if fallback == "market_proxy":
+        return "No hay una noticia logística dominante: el nivel se estima con proxy de mercado porque las fuentes de noticias fueron insuficientes."
+    if fallback == "neutral_low_confidence":
+        return "No hay una situación logística dominante clara: faltan noticias recientes suficientes y la lectura es de baja confianza."
+
+    if diagnostics.get("operationalNormalizationArticles", 0) >= 3 and score <= 48:
+        rule = next(r for r in LOGISTICS_MAIN_SITUATION_RULES if r["key"] == "normalization")
+        return f"{rule['label']}: {rule['summary']}"
+
+    weights = {rule["key"]: 0.0 for rule in LOGISTICS_MAIN_SITUATION_RULES}
+    hit_terms = {rule["key"]: [] for rule in LOGISTICS_MAIN_SITUATION_RULES}
+
+    for article in articles or []:
+        title = str(article.get("title") or "")
+        description = str(article.get("description") or "")
+        query_name = str(article.get("queryName") or "")
+        text = f"{title} {description} {query_name}".lower()
+        article_weight = (
+            recency_weight(article.get("seendate", ""))
+            * source_weight(str(article.get("domain") or "").lower().replace("www.", ""))
+            * provider_weight(article.get("provider", ""))
+        )
+
+        for rule in LOGISTICS_MAIN_SITUATION_RULES:
+            term_hits = [term for term in rule["terms"] if term in text]
+            query_hit = query_name in rule["query_names"]
+            if term_hits or query_hit:
+                weights[rule["key"]] += article_weight * (5 if query_hit else 0) + article_weight * 3 * len(term_hits)
+                for term in term_hits:
+                    if term not in hit_terms[rule["key"]] and len(hit_terms[rule["key"]]) < 4:
+                        hit_terms[rule["key"]].append(term)
+
+    driver_text = " ".join(str(d).lower() for d in drivers)
+    for rule in LOGISTICS_MAIN_SITUATION_RULES:
+        for term in rule["terms"]:
+            if term in driver_text:
+                weights[rule["key"]] += 4
+                if term not in hit_terms[rule["key"]] and len(hit_terms[rule["key"]]) < 4:
+                    hit_terms[rule["key"]].append(term)
+
+    # When stress is high, avoid saying "normalization" is the main cause unless the score actually dropped.
+    if score >= 60:
+        weights["normalization"] *= 0.20
+
+    top_key = max(weights, key=weights.get) if weights else None
+    top_score = weights.get(top_key, 0) if top_key else 0
+
+    if top_key and top_score > 0:
+        rule = next(r for r in LOGISTICS_MAIN_SITUATION_RULES if r["key"] == top_key)
+        signal_text = ""
+        if hit_terms[top_key]:
+            signal_text = " Señales detectadas: " + ", ".join(hit_terms[top_key][:4]) + "."
+        return f"{rule['label']}: {rule['summary']}{signal_text}"
+
+    if score >= 60:
+        return "No hay un único foco dominante claro: el nivel alto parece venir de una combinación de titulares sobre disrupciones, desvíos, seguros o rutas marítimas."
+    if level in ("bajo", "leve"):
+        return "No hay una disrupción logística dominante: las señales recientes son dispersas o de baja intensidad."
+    return "No hay una situación logística dominante clara: el score refleja una combinación de señales moderadas en noticias y mercado."
+
 def market_logistics_proxy_score():
     # Used only as low-confidence fallback or tie-breaker when news sources are scarce.
     fred_key = os.environ.get("FRED_API_KEY", "").strip()
@@ -1742,6 +1908,7 @@ def heuristic_logistics_score(articles, provider_counts=None, provider_errors=No
                 "level": market_proxy["level"],
                 "confidence": market_proxy["confidence"],
                 "summary": market_proxy["summary"],
+                "mainSituation": "No hay una noticia logística dominante: el nivel se estima con proxy de mercado porque las fuentes de noticias fueron insuficientes.",
                 "drivers": market_proxy["drivers"] + ["sin noticias multi-fuente"],
                 "diagnostics": {
                     "articleCount": 0,
@@ -1764,6 +1931,7 @@ def heuristic_logistics_score(articles, provider_counts=None, provider_errors=No
             "level": "moderado",
             "confidence": 0.06,
             "summary": "No se pudieron obtener noticias recientes de ninguna fuente; el valor es neutral-bajo y no debe interpretarse como lectura real de riesgo.",
+            "mainSituation": "No hay una situación logística dominante clara: faltan noticias recientes suficientes y la lectura es de baja confianza.",
             "drivers": ["sin datos multi-fuente"],
             "diagnostics": {
                 "articleCount": 0,
@@ -1932,29 +2100,39 @@ def heuristic_logistics_score(articles, provider_counts=None, provider_errors=No
     if operational_normalization_articles >= 3 and score <= 48:
         summary = "Las fuentes recientes sugieren normalización operativa: reapertura, tráfico retomándose, navieras volviendo a rutas o costes de seguro/flete bajando."
 
+    diagnostics = {
+        "articleCount": article_count,
+        "sourceDiversity": source_diversity,
+        "providerDiversity": provider_diversity,
+        "crisisArticles": crisis_articles,
+        "severeArticles": severe_articles,
+        "hormuzCrisisArticles": hormuz_crisis_articles,
+        "reliefArticles": relief_articles,
+        "operationalNormalizationArticles": operational_normalization_articles,
+        "politicalReliefOnlyArticles": political_relief_only_articles,
+        "weightedCrisis": round(weighted_crisis, 2),
+        "weightedRelief": round(weighted_relief, 2),
+        "sampleTitles": sample_titles,
+        "providerCounts": provider_counts,
+        "providerErrors": provider_errors,
+        "fallback": None,
+    }
+    clean_drivers = drivers or ["sin drivers críticos detectados"]
+
     return {
         "score": score,
         "level": logistics_level(score),
         "confidence": confidence,
         "summary": summary,
-        "drivers": drivers or ["sin drivers críticos detectados"],
-        "diagnostics": {
-            "articleCount": article_count,
-            "sourceDiversity": source_diversity,
-            "providerDiversity": provider_diversity,
-            "crisisArticles": crisis_articles,
-            "severeArticles": severe_articles,
-            "hormuzCrisisArticles": hormuz_crisis_articles,
-            "reliefArticles": relief_articles,
-            "operationalNormalizationArticles": operational_normalization_articles,
-            "politicalReliefOnlyArticles": political_relief_only_articles,
-            "weightedCrisis": round(weighted_crisis, 2),
-            "weightedRelief": round(weighted_relief, 2),
-            "sampleTitles": sample_titles,
-            "providerCounts": provider_counts,
-            "providerErrors": provider_errors,
-            "fallback": None,
-        }
+        "mainSituation": infer_logistics_main_situation(
+            articles,
+            drivers=clean_drivers,
+            diagnostics=diagnostics,
+            score=score,
+            level=logistics_level(score),
+        ),
+        "drivers": clean_drivers,
+        "diagnostics": diagnostics,
     }
 
 def ai_logistics_score(articles):
@@ -1992,6 +2170,13 @@ def assess_logistics_stress_from_news():
         "level": result["level"],
         "confidence": result["confidence"],
         "summary": result["summary"],
+        "mainSituation": result.get("mainSituation") or infer_logistics_main_situation(
+            articles,
+            drivers=result.get("drivers", []),
+            diagnostics=result.get("diagnostics", {}),
+            score=result.get("score", result.get("latest", 0)),
+            level=result.get("level"),
+        ),
         "drivers": result["drivers"],
         "articleCount": len(articles),
         "sampleArticles": articles[:12],
@@ -2767,6 +2952,8 @@ def history():
             "frequency": "monthly-last-observation",
             "warnings": warnings,
             "sp500Available": any(("sp500" in row and row.get("sp500") not in (None, "", ".", "-")) for row in rows),
+            "gscpiAvailable": any(("gscpi" in row and row.get("gscpi") not in (None, "", ".", "-")) for row in rows),
+            "gscpiCount": sum(1 for row in rows if "gscpi" in row and row.get("gscpi") not in (None, "", ".", "-")),
         })
 
     except Exception as error:
