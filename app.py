@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v15-assets-recession-confidence",
+        "version": "pro-free-logistics-dynamic-multisource-v17-daily-history",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -731,6 +731,49 @@ def last_observation_per_month(observations):
         by_month[month_key(date)] = numeric
     return by_month
 
+
+def monthly_stats_from_observations(observations):
+    """Return monthly last/min/max/avg stats from daily or irregular observations.
+
+    For daily market series like VIXCLS, the monthly line can still use the last
+    available close of each month, but period summaries should not pretend that
+    this is the maximum stress reached inside the month.
+    """
+    grouped = {}
+    for obs in sorted(observations or [], key=lambda x: str(x.get("date", ""))):
+        if not isinstance(obs, dict):
+            continue
+        date = obs.get("date")
+        value = obs.get("value")
+        if date in (None, "") or value in (None, "", ".", "-"):
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        key = month_key(date)
+        grouped.setdefault(key, []).append({"date": str(date)[:10], "value": numeric})
+
+    out = {}
+    for key, values in grouped.items():
+        if not values:
+            continue
+        values = sorted(values, key=lambda x: x["date"])
+        nums = [v["value"] for v in values]
+        max_item = max(values, key=lambda x: x["value"])
+        min_item = min(values, key=lambda x: x["value"])
+        out[key] = {
+            "last": values[-1]["value"],
+            "lastDate": values[-1]["date"],
+            "max": max_item["value"],
+            "maxDate": max_item["date"],
+            "min": min_item["value"],
+            "minDate": min_item["date"],
+            "avg": sum(nums) / len(nums),
+            "count": len(nums),
+        }
+    return out
+
 def header_date_columns(row):
     cols = []
     for c, cell in enumerate(row):
@@ -1352,13 +1395,29 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
     for key, (series_id, _label) in FRED_SERIES.items():
         try:
             obs = fred_observations(series_id, fred_key, start, end)
-            by_month = last_observation_per_month(obs)
 
-            for date_key, value in by_month.items():
-                monthly.setdefault(date_key, {"date": date_key})
-                monthly[date_key][key] = round(value, 4)
-        except Exception:
-            pass
+            if key == "vix":
+                stats_by_month = monthly_stats_from_observations(obs)
+                for date_key, stats in stats_by_month.items():
+                    monthly.setdefault(date_key, {"date": date_key})
+                    # Main VIX value remains the last available daily close in that month,
+                    # so the line chart stays comparable with other monthly-last series.
+                    monthly[date_key][key] = round(stats["last"], 4)
+                    # Extra fields preserve the intramonth daily-close stress that the old
+                    # monthly rollup was hiding.
+                    monthly[date_key]["vixMonthlyMax"] = round(stats["max"], 4)
+                    monthly[date_key]["vixMonthlyMaxDate"] = stats["maxDate"]
+                    monthly[date_key]["vixMonthlyMin"] = round(stats["min"], 4)
+                    monthly[date_key]["vixMonthlyMinDate"] = stats["minDate"]
+                    monthly[date_key]["vixMonthlyAvg"] = round(stats["avg"], 4)
+                    monthly[date_key]["vixDailyObservationCount"] = stats["count"]
+            else:
+                by_month = last_observation_per_month(obs)
+                for date_key, value in by_month.items():
+                    monthly.setdefault(date_key, {"date": date_key})
+                    monthly[date_key][key] = round(value, 4)
+        except Exception as error:
+            warnings.append(f"{key} histórico no se pudo cargar desde FRED {series_id}: {error}")
 
     gscpi_loaded = False
     gscpi_errors = []
@@ -1418,6 +1477,129 @@ def build_monthly_history(start: str, end: str, fred_key: str, bls_key: str | No
 
     for row in rows:
         enrich_history_row(row)
+
+    return rows, warnings
+
+
+def normalize_history_date(value: str | None, default: str | None = None):
+    text = str(value or default or datetime.now().strftime("%Y-%m-%d")).strip()[:10]
+    if re.fullmatch(r"\d{4}-\d{2}$", text):
+        text = text + "-01"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}$", text):
+        text = datetime.now().strftime("%Y-%m-%d")
+    return text
+
+
+def shift_iso_date(value: str, days: int):
+    base = datetime.strptime(normalize_history_date(value), "%Y-%m-%d")
+    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def build_daily_history(start: str, end: str, fred_key: str, bls_key: str | None = None, bls_series: str = ""):
+    """Build daily historical rows.
+
+    Market variables such as VIX, Brent, HY OAS, rates and S&P 500 are taken at
+    daily frequency when the provider publishes them. Slower variables such as
+    Core PCE, unemployment, Sahm Rule and GSCPI are carried forward from their
+    latest official release so the daily row remains analytically complete.
+    """
+    start = normalize_history_date(start)
+    end = normalize_history_date(end)
+    extended_start = shift_iso_date(start, -430)
+
+    daily = {}
+    warnings = []
+
+    def set_value(date_text, key, value):
+        if value in (None, "", ".", "-"):
+            return
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return
+        date_key = normalize_history_date(date_text)
+        daily.setdefault(date_key, {"date": date_key, "_frequency": "daily"})
+        daily[date_key][key] = round(numeric, 6)
+
+    ten_year = {}
+    two_year = {}
+
+    for key, (series_id, _label) in FRED_SERIES.items():
+        try:
+            obs = fred_observations(series_id, fred_key, extended_start, end)
+            if key == "tenYearYield":
+                ten_year = {normalize_history_date(o["date"]): float(o["value"]) for o in obs if o.get("value") not in (None, "", ".", "-")}
+                continue
+            if key == "twoYearYield":
+                two_year = {normalize_history_date(o["date"]): float(o["value"]) for o in obs if o.get("value") not in (None, "", ".", "-")}
+                continue
+            for item in obs:
+                set_value(item.get("date"), key, item.get("value"))
+        except Exception as error:
+            warnings.append(f"{key} diario no se pudo cargar desde FRED {series_id}: {error}")
+
+    for date_key in sorted(set(ten_year) & set(two_year)):
+        set_value(date_key, "yieldCurve10y2y", ten_year[date_key] - two_year[date_key])
+
+    try:
+        gscpi_obs = fetch_gscpi_nyfed_history(extended_start, end)
+        for item in gscpi_obs:
+            set_value(item.get("date"), "gscpi", item.get("value"))
+    except Exception as error:
+        warnings.append(f"GSCPI diario/carry-forward no se pudo cargar desde NY Fed: {error}")
+        try:
+            for item in fred_observations("GSCPI", fred_key, extended_start, end):
+                set_value(item.get("date"), "gscpi", item.get("value"))
+        except Exception as fred_error:
+            warnings.append(f"GSCPI fallback FRED/API no se pudo cargar: {fred_error}")
+
+    try:
+        core_history = fetch_fred_yoy_history("PCEPILFE", fred_key, shift_iso_date(start, -760), end)
+        for item in core_history:
+            set_value(item.get("date"), "coreInflation", item.get("value"))
+    except Exception as error:
+        warnings.append(f"Core PCE diario/carry-forward no se pudo cargar: {error}")
+
+    try:
+        sp500_obs = fetch_sp500_history(start, end, fred_key)
+        for item in sp500_obs:
+            set_value(item.get("date"), "sp500", item.get("value"))
+    except Exception as error:
+        warnings.append(f"S&P 500 diario no se pudo cargar: {error}")
+
+    # Iterate all provider event dates, including the extended lookback, to seed
+    # carry-forward values before the requested start date.
+    all_dates = sorted(daily.keys())
+    carry = {}
+    rows = []
+    carry_keys = [
+        "brent", "creditSpreads", "vix", "usdStrength", "tenYearBreakeven", "realYield10y",
+        "yieldCurve10y2y", "unemployment", "sahmRule", "smoothedRecessionProbability",
+        "initialClaims", "gscpi", "coreInflation", "sp500"
+    ]
+
+    for date_key in all_dates:
+        event_row = daily.get(date_key, {})
+        for key in carry_keys:
+            if key in event_row and event_row.get(key) not in (None, "", ".", "-"):
+                carry[key] = event_row[key]
+
+        if date_key < start or date_key > end:
+            continue
+
+        row = {"date": date_key, "_frequency": "daily"}
+        for key in carry_keys:
+            if key in carry:
+                row[key] = carry[key]
+        # Preserve exact same-day observations on top of carried values.
+        row.update({k: v for k, v in event_row.items() if k not in ("date",)})
+        row["_frequency"] = "daily"
+        enrich_history_row(row)
+        rows.append(row)
+
+    rows.sort(key=lambda r: str(r.get("date", "")))
+    if not rows:
+        warnings.append("No se generaron filas diarias para el rango solicitado. Revisá FRED_API_KEY, fechas y disponibilidad de proveedores.")
 
     return rows, warnings
 
@@ -3362,7 +3544,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v15-assets-recession-confidence",
+            "version": "pro-free-logistics-dynamic-multisource-v17-daily-history",
         }
     })
 
@@ -3393,7 +3575,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v15-assets-recession-confidence",
+                "version": "pro-free-logistics-dynamic-multisource-v17-daily-history",
             }
         }
 
@@ -3728,7 +3910,7 @@ def gscpi_history():
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
 
-@app.post("/api/history")
+@app.route("/api/history", methods=["GET", "POST", "OPTIONS"])
 def history():
     try:
         payload = request.get_json(force=True, silent=True) or {}
@@ -3738,10 +3920,18 @@ def history():
         if not fred_key:
             return jsonify({"ok": False, "error": "FRED_API_KEY no está configurada en Render"}), 400
 
-        start = str(payload.get("start", "2003-01-01"))
-        end = str(payload.get("end", datetime.now().strftime("%Y-%m-%d")))
+        start = str(request.args.get("start") or payload.get("start", "2003-01-01"))
+        end = str(request.args.get("end") or payload.get("end", datetime.now().strftime("%Y-%m-%d")))
+        frequency = str(request.args.get("frequency") or payload.get("frequency") or "monthly").lower().strip()
 
-        rows, warnings = build_monthly_history(start, end, fred_key, None, "")
+        if frequency in ("daily", "day", "diaria"):
+            rows, warnings = build_daily_history(start, end, fred_key, None, "")
+            normalized_frequency = "daily"
+        else:
+            rows, warnings = build_monthly_history(start, end, fred_key, None, "")
+            for row in rows:
+                row.setdefault("_frequency", "monthly")
+            normalized_frequency = "monthly"
 
         return jsonify({
             "ok": True,
@@ -3749,11 +3939,16 @@ def history():
             "end": end,
             "rows": rows,
             "count": len(rows),
-            "frequency": "monthly-last-observation",
+            "frequency": normalized_frequency,
+            "methodology": "daily usa observaciones diarias cuando existen y carry-forward de series oficiales mensuales/semanales; monthly usa último dato disponible del mes con extremos diarios de VIX.",
             "warnings": warnings,
             "sp500Available": any(("sp500" in row and row.get("sp500") not in (None, "", ".", "-")) for row in rows),
             "gscpiAvailable": any(("gscpi" in row and row.get("gscpi") not in (None, "", ".", "-")) for row in rows),
             "gscpiCount": sum(1 for row in rows if "gscpi" in row and row.get("gscpi") not in (None, "", ".", "-")),
+            "vixDailyAvailable": any(("vix" in row and row.get("vix") not in (None, "", ".", "-")) for row in rows),
+            "vixDailyCount": sum(1 for row in rows if "vix" in row and row.get("vix") not in (None, "", ".", "-")),
+            "vixDailyExtremaAvailable": any(("vixMonthlyMax" in row and row.get("vixMonthlyMax") not in (None, "", ".", "-")) for row in rows),
+            "vixDailyExtremaCount": sum(1 for row in rows if "vixMonthlyMax" in row and row.get("vixMonthlyMax") not in (None, "", ".", "-")),
         })
 
     except Exception as error:
