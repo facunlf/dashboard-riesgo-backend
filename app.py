@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v17-daily-history",
+        "version": "pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -949,6 +949,97 @@ def fetch_fred_latest(series_id: str, api_key: str):
         "date": latest["date"],
         "series": series_id,
     }
+
+
+
+def fetch_yahoo_chart_latest(symbol: str, label: str):
+    """Fetch a near-real-time delayed market quote from Yahoo Finance chart API."""
+    encoded_symbol = urllib.parse.quote(symbol, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?"
+        + urllib.parse.urlencode({"range": "5d", "interval": "1m"})
+    )
+
+    payload = fetch_json(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 macro-risk-dashboard/1.0",
+        "Accept": "application/json,text/plain,*/*",
+    })
+
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        error = ((payload.get("chart") or {}).get("error") or {}).get("description")
+        raise ValueError(f"Yahoo Finance {symbol}: sin datos" + (f" ({error})" if error else ""))
+
+    meta = result.get("meta") or {}
+    timestamps = result.get("timestamp") or []
+    quote = (((result.get("indicators") or {}).get("quote") or [{}])[0]) or {}
+    closes = quote.get("close") or []
+
+    latest_value = meta.get("regularMarketPrice")
+    previous_value = meta.get("chartPreviousClose") or meta.get("previousClose")
+    latest_ts = meta.get("regularMarketTime")
+
+    valid_points = []
+    for ts, close in zip(timestamps, closes):
+        if close is None:
+            continue
+        try:
+            valid_points.append((int(ts), float(close)))
+        except (TypeError, ValueError):
+            continue
+
+    if latest_value in (None, "", ".", "-") and valid_points:
+        latest_ts, latest_value = valid_points[-1]
+
+    if previous_value in (None, "", ".", "-"):
+        previous_value = valid_points[-2][1] if len(valid_points) > 1 else latest_value
+
+    if latest_value in (None, "", ".", "-"):
+        raise ValueError(f"Yahoo Finance {symbol}: último precio no disponible")
+
+    latest_value = float(latest_value)
+    try:
+        previous_value = float(previous_value) if previous_value not in (None, "", ".", "-") else latest_value
+    except (TypeError, ValueError):
+        previous_value = latest_value
+
+    try:
+        date = datetime.fromtimestamp(int(latest_ts), tz=timezone.utc).strftime("%Y-%m-%d") if latest_ts else datetime.utcnow().strftime("%Y-%m-%d")
+        market_time = datetime.fromtimestamp(int(latest_ts), tz=timezone.utc).isoformat() if latest_ts else None
+    except Exception:
+        date = datetime.utcnow().strftime("%Y-%m-%d")
+        market_time = None
+
+    return {
+        "latest": round(latest_value, 2),
+        "previous": round(previous_value, 2),
+        "date": date,
+        "series": symbol,
+        "source": f"Yahoo Finance {label} ({symbol})",
+        "marketTimeUtc": market_time,
+        "provider": "Yahoo Finance chart API",
+        "note": "Cotización de mercado/futuro con retraso; más actual que FRED spot DCOILBRENTEU.",
+    }
+
+
+def fetch_brent_latest(fred_key: str | None = None):
+    """Prefer intraday/delayed market data for Brent; fallback to official FRED spot."""
+    errors = []
+    try:
+        return fetch_yahoo_chart_latest("BZ=F", "Brent futures")
+    except Exception as error:
+        errors.append(f"Yahoo Finance BZ=F: {error}")
+
+    if fred_key:
+        try:
+            item = fetch_fred_latest("DCOILBRENTEU", fred_key)
+            item["source"] = "FRED DCOILBRENTEU (fallback oficial, no intradía)"
+            item["note"] = "Fallback: FRED puede publicar Brent con retraso frente al mercado."
+            return item
+        except Exception as error:
+            errors.append(f"FRED DCOILBRENTEU: {error}")
+
+    raise ValueError("; ".join(errors) if errors else "No se pudo obtener Brent")
 
 def fred_yoy_source_label(series_id: str):
     labels = {
@@ -2428,7 +2519,7 @@ def market_logistics_proxy_score():
         return None
 
     try:
-        brent = fetch_fred_latest("DCOILBRENTEU", fred_key)
+        brent = fetch_brent_latest(fred_key)
         value = float(brent.get("latest", 0))
         points = clamp((value - 75) * 0.8, 0, 22)
         components.append(points)
@@ -3532,7 +3623,7 @@ def currency_dominance_payload(start: str, end: str):
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO v20 Core PCE + fechas completas por indicador funcionando",
+        "message": "Backend PRO v21 Brent Yahoo realtime + Core PCE funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -3544,7 +3635,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v17-daily-history",
+            "version": "pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime",
         }
     })
 
@@ -3575,7 +3666,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v17-daily-history",
+                "version": "pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime",
             }
         }
 
@@ -3615,8 +3706,17 @@ def official_data():
 
         jobs = {}
         with ThreadPoolExecutor(max_workers=12) as executor:
+            # Brent is market-sensitive: use Yahoo Finance BZ=F first so it can refresh
+            # during the day. If Yahoo fails, fetch_brent_latest falls back to FRED.
+            future = executor.submit(
+                lambda: stamp_update(fetch_brent_latest(fred_key), calculation_date, "Yahoo Finance BZ=F / FRED fallback")
+            )
+            jobs[future] = {"kind": "fred", "key": "brent", "label": "Brent", "series": "BZ=F"}
+
             if fred_key:
                 for key, (series, label) in FRED_SERIES.items():
+                    if key == "brent":
+                        continue
                     future = executor.submit(
                         lambda s=series: stamp_update(fetch_fred_latest(s, fred_key), calculation_date, f"FRED {s}")
                     )

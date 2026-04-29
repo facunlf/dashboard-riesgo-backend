@@ -1,50 +1,27 @@
-Backend PresuFlow/Macro Dashboard - estrés logístico dinámico
+RIESGO MACRO - PAQUETE COMPLETO ÚLTIMA VERSIÓN
 
-Qué cambia:
-- Reemplaza el cálculo simple de estrés logístico por un cálculo dinámico multi-query en GDELT.
-- Busca señales de crisis: ataques, barcos capturados, cierre/bloqueo, navieras suspendiendo rutas, desvíos, war risk insurance, fletes, congestión.
-- Busca señales de normalización: acuerdo, ceasefire, reapertura, shipping resumes, traffic resumes, normal traffic, rutas restauradas, caída de seguros/fletes.
-- No usa override fijo. Si mañana las noticias muestran normalización real, el score puede caer automáticamente.
-- Añade diagnostics al resultado para entender articleCount, sourceDiversity, crisisArticles, severeArticles, reliefArticles, weightedCrisis y weightedRelief.
-
-Dónde cargarlo:
-- Este archivo app.py va en el repositorio BACKEND que desplegás en Render.
-- NO va en Netlify. Netlify solo usa el HTML/frontend.
+Contenido:
+- app.py: backend Flask listo para Render.
+- requirements.txt: dependencias del backend.
+- frontend-netlify/index.html: frontend estático listo para Netlify.
 
 Render:
-Build Command:
-pip install -r requirements.txt
+1) Subir este contenido a GitHub.
+2) En Render crear/actualizar Web Service apuntando a este repositorio.
+3) Si Render pregunta por Root Directory, dejar vacío si app.py queda en la raíz.
+4) Build Command: pip install -r requirements.txt
+5) Start Command: gunicorn app:app
+6) Variables recomendadas:
+   - FRED_API_KEY: tu clave FRED.
+   - PYTHON_VERSION: 3.11.9 o compatible.
 
-Start Command:
-gunicorn app:app
+Netlify:
+- Si también querés desplegar el frontend, en Netlify usar:
+  Base directory: frontend-netlify
+  Publish directory: .
+  Build command: vacío
 
-Variable necesaria:
-FRED_API_KEY=tu_clave_de_fred
-
-Pasos:
-1. Reemplazá el app.py actual de tu repositorio backend por este app.py.
-2. Conservá requirements.txt.
-3. Hacé commit y push a GitHub.
-4. Render debería redesplegar automáticamente.
-5. Probá en el navegador:
-   https://TU-BACKEND.onrender.com/health
-6. Luego, desde el dashboard en Netlify, pulsá "Actualizar indicadores".
-
-Prueba directa del endpoint:
-POST https://TU-BACKEND.onrender.com/api/logistics-stress-news
-
-Respuesta esperada:
-{
-  "ok": true,
-  "result": {
-    "latest": 0-100,
-    "level": "bajo|leve|moderado|alto|severo",
-    "source": "GDELT multi-query dynamic heuristic",
-    "articleCount": número,
-    "diagnostics": {...}
-  }
-}
-
-Si articleCount = 0:
-- El problema no es la fórmula: Render no pudo obtener noticias de GDELT o GDELT no devolvió resultados.
-- En ese caso revisá logs de Render y conectividad externa.
+Nota versión:
+- Backend: pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime.
+- Brent intenta primero Yahoo Finance BZ=F para dato de mercado más reciente.
+- Si Yahoo falla, usa FRED DCOILBRENTEU como fallback oficial, que puede venir con retraso.
