@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe",
+        "version": "pro-free-logistics-dynamic-multisource-v21-brent-nymex-vix-yahoo",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -1089,19 +1089,13 @@ def fetch_brent_latest(fred_key: str | None = None):
 
 
 def fetch_vix_latest(fred_key: str | None = None):
-    """Prefer Google Finance INDEXCBOE:VIX latest quote; fallback to Yahoo ^VIX and then FRED VIXCLS."""
+    """Prefer Yahoo Finance ^VIX latest quote; fallback to FRED VIXCLS."""
     errors = []
-    try:
-        item = fetch_google_finance_latest("VIX", "INDEXCBOE", "CBOE Volatility Index")
-        item["note"] = "Cotización retrasada de mercado para INDEXCBOE:VIX; se usa como fuente principal del VIX actual."
-        return item
-    except Exception as error:
-        errors.append(f"Google Finance VIX:INDEXCBOE: {error}")
 
     try:
         item = fetch_yahoo_chart_latest("^VIX", "CBOE Volatility Index")
-        item["source"] = "Yahoo Finance ^VIX (fallback de mercado)"
-        item["note"] = "Fallback de mercado: se usa si Google Finance INDEXCBOE:VIX no responde."
+        item["source"] = "Yahoo Finance ^VIX"
+        item["note"] = "Cotización de mercado para el VIX actual. No se usa Google Finance INDEXCBOE:VIX."
         return item
     except Exception as error:
         errors.append(f"Yahoo Finance ^VIX: {error}")
@@ -1116,7 +1110,6 @@ def fetch_vix_latest(fred_key: str | None = None):
             errors.append(f"FRED VIXCLS: {error}")
 
     raise ValueError("; ".join(errors) if errors else "No se pudo obtener VIX")
-
 
 def fred_yoy_source_label(series_id: str):
     labels = {
@@ -3700,7 +3693,7 @@ def currency_dominance_payload(start: str, end: str):
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO v20 Brent NYMEX BZW00 + VIX CBOE + Core PCE funcionando",
+        "message": "Backend PRO v21 Brent NYMEX BZW00 + VIX Yahoo ^VIX + Core PCE funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -3712,7 +3705,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe",
+            "version": "pro-free-logistics-dynamic-multisource-v21-brent-nymex-vix-yahoo",
         }
     })
 
@@ -3743,7 +3736,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe",
+                "version": "pro-free-logistics-dynamic-multisource-v21-brent-nymex-vix-yahoo",
             }
         }
 
@@ -3791,9 +3784,9 @@ def official_data():
             jobs[future] = {"kind": "fred", "key": "brent", "label": "Brent", "series": "BZW00:NYMEX"}
 
             future = executor.submit(
-                lambda: stamp_update(fetch_vix_latest(fred_key), calculation_date, "Google Finance INDEXCBOE:VIX / Yahoo ^VIX / FRED fallback")
+                lambda: stamp_update(fetch_vix_latest(fred_key), calculation_date, "Yahoo Finance ^VIX / FRED fallback")
             )
-            jobs[future] = {"kind": "fred", "key": "vix", "label": "VIX", "series": "VIX:INDEXCBOE"}
+            jobs[future] = {"kind": "fred", "key": "vix", "label": "VIX", "series": "^VIX"}
 
             if fred_key:
                 for key, (series, label) in FRED_SERIES.items():

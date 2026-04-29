@@ -416,7 +416,7 @@ const indicatorDefs = [
   ["realYield10y","Real yield 10Y","tipos",1.7,1.6,"%",1.15,"FRED DFII10","Tipos reales altos enfrían economía y múltiplos.",{green:"≤ 1.0%",yellow:"> 1.0% y ≤ 1.75%",red:"> 1.75%"}],
   ["globalPMI","PMI global","demanda",50.7,51.0,"",1.25,"S&P Global / J.P. Morgan / fuentes confiables","Indicador de actividad global obtenido prioritariamente desde S&P Global PMI y J.P. Morgan Global Composite PMI; si no hay lectura oficial disponible, puede usar otras fuentes confiables o proxy macro de baja confianza.",{green:"≥ 52",yellow:"≥ 50 y < 52",red:"< 50"},true],
   ["creditSpreads","High Yield OAS","crédito",3.0,2.85,"%",1.6,"FRED","Mejor alarma de estrés sistémico.",{green:"≤ 4.0%",yellow:"> 4.0% y ≤ 5.5%",red:"> 5.5%"}],
-  ["vix","VIX","volatilidad",18,16,"",1.1,"INDEXCBOE:VIX","Miedo y volatilidad implícita.",{green:"≤ 20",yellow:"> 20 y ≤ 30",red:"> 30"}],
+  ["vix","VIX","volatilidad",18,16,"",1.1,"Yahoo Finance ^VIX","Miedo y volatilidad implícita.",{green:"≤ 20",yellow:"> 20 y ≤ 30",red:"> 30"}],
   ["yieldCurve10y2y","Curva 10Y-2Y","curva",0.15,0.05," pp",1.0,"FRED DGS10-DGS2","Curva invertida o muy negativa anticipa estrés/recesión.",{green:"≥ 0.25",yellow:"≥ -0.50 y < 0.25",red:"< -0.50"},true],
   ["tenYearBreakeven","Breakeven 10Y","expectativas",2.35,2.25,"%",0.9,"FRED T10YIE","Expectativas de inflación de mercado.",{green:"≤ 2.4%",yellow:"> 2.4% y ≤ 2.8%",red:"> 2.8%"}],
   ["recessionRisk","Riesgo recesión","macro",20.1,18.8,"%",1.0,"Calculado","Riesgo calculado con curva 10Y-2Y, desempleo, HY OAS, VIX, PMI global y noticias macro vía GDELT.",{green:"≤ 20%",yellow:"> 20% y ≤ 30%",red:"> 30%"}],

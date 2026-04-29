@@ -53,10 +53,10 @@ CAMBIO v19 - Brent NYMEX:BZW00
 - Brent ahora intenta primero Google Finance NYMEX:BZW00.
 - Si Google Finance no responde, usa Yahoo Finance BZ=F como fallback de mercado.
 - Si también falla y existe FRED_API_KEY, usa FRED DCOILBRENTEU como fallback oficial.
-- La versión esperada en /health es pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe.
+- La versión esperada en /health es pro-free-logistics-dynamic-multisource-v21-brent-nymex-vix-yahoo.
 
-CAMBIO v20 - VIX INDEXCBOE:VIX
-- VIX ahora intenta primero Google Finance INDEXCBOE:VIX.
-- Si esa fuente falla, usa Yahoo Finance ^VIX.
+CAMBIO v21 - VIX Yahoo Finance ^VIX
+- VIX ahora intenta primero Yahoo Finance ^VIX.
+- Se elimina Google Finance INDEXCBOE:VIX como fuente prioritaria para evitar parseos erróneos.
 - FRED VIXCLS queda como fallback final, porque puede ir con retraso frente a mercado.
 - Se mantiene la separación de despliegue: Netlify solo frontend y Render backend.
