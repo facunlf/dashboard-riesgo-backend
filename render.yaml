@@ -6,3 +6,8 @@ services:
     startCommand: gunicorn app:app
     plan: free
     autoDeploy: true
+    buildFilter:
+      paths:
+        - app.py
+        - requirements.txt
+        - render.yaml

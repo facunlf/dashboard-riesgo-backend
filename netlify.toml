@@ -1,0 +1,7 @@
+[build]
+  base = "frontend-netlify"
+  publish = "."
+  command = "echo 'Frontend estático: no build necesario'"
+  # Netlify ignora el deploy cuando este comando devuelve 0.
+  # Solo desplegará si cambiaron archivos del frontend o este propio netlify.toml.
+  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- frontend-netlify/ netlify.toml"

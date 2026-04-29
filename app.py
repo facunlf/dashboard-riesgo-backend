@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime",
+        "version": "pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -1022,11 +1022,57 @@ def fetch_yahoo_chart_latest(symbol: str, label: str):
     }
 
 
+def fetch_google_finance_latest(symbol: str, exchange: str, label: str):
+    """Fetch a delayed market quote from Google Finance, e.g. BZW00:NYMEX."""
+    ticker = f"{symbol}:{exchange}"
+    encoded_ticker = urllib.parse.quote(ticker, safe="")
+    url = f"https://www.google.com/finance/quote/{encoded_ticker}?hl=en"
+
+    raw = fetch_text(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 macro-risk-dashboard/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+    }, timeout=12)
+
+    price_match = re.search(r'<div[^>]*class="[^"]*YMlKec[^"]*fxKbKc[^"]*"[^>]*>([^<]+)</div>', raw)
+    if not price_match:
+        price_match = re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)', raw)
+
+    if not price_match:
+        raise ValueError(f"Google Finance {ticker}: no se encontró precio")
+
+    price_text = html.unescape(price_match.group(1)).strip()
+    price_text = re.sub(r'[^0-9,.-]', '', price_text).replace(',', '')
+    latest_value = float(price_text)
+
+    time_match = re.search(r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M\s+UTC)', raw)
+    market_time = time_match.group(1) if time_match else None
+
+    return {
+        "latest": round(latest_value, 2),
+        "previous": round(latest_value, 2),
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "series": ticker,
+        "source": f"Google Finance {label} ({ticker})",
+        "marketTimeUtc": market_time,
+        "provider": "Google Finance quote page",
+        "note": "Cotización retrasada de mercado para NYMEX:BZW00; se usa como fuente principal del Brent.",
+    }
+
+
 def fetch_brent_latest(fred_key: str | None = None):
-    """Prefer intraday/delayed market data for Brent; fallback to official FRED spot."""
+    """Prefer NYMEX:BZW00 market data for Brent; fallback to Yahoo BZ=F and then official FRED spot."""
     errors = []
     try:
-        return fetch_yahoo_chart_latest("BZ=F", "Brent futures")
+        return fetch_google_finance_latest("BZW00", "NYMEX", "Brent Crude Oil Last Day Financial Futures")
+    except Exception as error:
+        errors.append(f"Google Finance BZW00:NYMEX: {error}")
+
+    try:
+        item = fetch_yahoo_chart_latest("BZ=F", "Brent futures")
+        item["source"] = "Yahoo Finance BZ=F (fallback de mercado)"
+        item["note"] = "Fallback de mercado: se usa si Google Finance NYMEX:BZW00 no responde."
+        return item
     except Exception as error:
         errors.append(f"Yahoo Finance BZ=F: {error}")
 
@@ -1034,7 +1080,7 @@ def fetch_brent_latest(fred_key: str | None = None):
         try:
             item = fetch_fred_latest("DCOILBRENTEU", fred_key)
             item["source"] = "FRED DCOILBRENTEU (fallback oficial, no intradía)"
-            item["note"] = "Fallback: FRED puede publicar Brent con retraso frente al mercado."
+            item["note"] = "Fallback final: FRED puede publicar Brent con retraso frente al mercado."
             return item
         except Exception as error:
             errors.append(f"FRED DCOILBRENTEU: {error}")
@@ -3623,7 +3669,7 @@ def currency_dominance_payload(start: str, end: str):
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO v21 Brent Yahoo realtime + Core PCE funcionando",
+        "message": "Backend PRO v22 Brent NYMEX BZW00 + Core PCE funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -3635,7 +3681,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime",
+            "version": "pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00",
         }
     })
 
@@ -3666,7 +3712,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime",
+                "version": "pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00",
             }
         }
 
@@ -3706,12 +3752,12 @@ def official_data():
 
         jobs = {}
         with ThreadPoolExecutor(max_workers=12) as executor:
-            # Brent is market-sensitive: use Yahoo Finance BZ=F first so it can refresh
-            # during the day. If Yahoo fails, fetch_brent_latest falls back to FRED.
+            # Brent is market-sensitive: use NYMEX:BZW00 first so it can refresh
+            # during the day. If Google Finance fails, fetch_brent_latest falls back to Yahoo and then FRED.
             future = executor.submit(
-                lambda: stamp_update(fetch_brent_latest(fred_key), calculation_date, "Yahoo Finance BZ=F / FRED fallback")
+                lambda: stamp_update(fetch_brent_latest(fred_key), calculation_date, "Google Finance NYMEX:BZW00 / Yahoo BZ=F / FRED fallback")
             )
-            jobs[future] = {"kind": "fred", "key": "brent", "label": "Brent", "series": "BZ=F"}
+            jobs[future] = {"kind": "fred", "key": "brent", "label": "Brent", "series": "BZW00:NYMEX"}
 
             if fred_key:
                 for key, (series, label) in FRED_SERIES.items():

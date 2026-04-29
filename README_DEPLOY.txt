@@ -1,27 +1,56 @@
-RIESGO MACRO - PAQUETE COMPLETO ÚLTIMA VERSIÓN
+RIESGO MACRO - PAQUETE COMPLETO v18
 
-Contenido:
-- app.py: backend Flask listo para Render.
-- requirements.txt: dependencias del backend.
-- frontend-netlify/index.html: frontend estático listo para Netlify.
+Estructura del repositorio
+-------------------------
+app.py                     Backend Flask para Render
+requirements.txt           Dependencias Python del backend
+render.yaml                Configuración Render del backend
+netlify.toml               Configuración Netlify para desplegar solo el frontend
+frontend-netlify/index.html Frontend estático para Netlify
 
-Render:
-1) Subir este contenido a GitHub.
-2) En Render crear/actualizar Web Service apuntando a este repositorio.
-3) Si Render pregunta por Root Directory, dejar vacío si app.py queda en la raíz.
-4) Build Command: pip install -r requirements.txt
-5) Start Command: gunicorn app:app
-6) Variables recomendadas:
-   - FRED_API_KEY: tu clave FRED.
-   - PYTHON_VERSION: 3.11.9 o compatible.
+Render
+------
+Render debe desplegar el backend completo desde la raíz del repositorio.
 
-Netlify:
-- Si también querés desplegar el frontend, en Netlify usar:
-  Base directory: frontend-netlify
-  Publish directory: .
-  Build command: vacío
+La configuración está en render.yaml:
+- buildCommand: pip install -r requirements.txt
+- startCommand: gunicorn app:app
+- autoDeploy: true
+- buildFilter: solo dispara autodeploy si cambian app.py, requirements.txt o render.yaml
 
-Nota versión:
-- Backend: pro-free-logistics-dynamic-multisource-v18-brent-yahoo-realtime.
-- Brent intenta primero Yahoo Finance BZ=F para dato de mercado más reciente.
-- Si Yahoo falla, usa FRED DCOILBRENTEU como fallback oficial, que puede venir con retraso.
+Esto evita que Render redepliegue por cambios hechos únicamente en frontend-netlify/.
+
+Netlify
+-------
+Netlify debe apuntar al mismo repositorio, pero usando:
+- Base directory: frontend-netlify
+- Publish directory: .
+- Build command: echo 'Frontend estático: no build necesario'
+
+Además, netlify.toml ya deja configurado:
+- base = "frontend-netlify"
+- publish = "."
+- ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- frontend-netlify/ netlify.toml"
+
+Importante: en Netlify, cuando el comando ignore devuelve 0, el deploy se cancela. Por eso esta configuración cancela deploys si solo cambió el backend.
+
+Flujo recomendado
+-----------------
+1. Subir este ZIP descomprimido a GitHub.
+2. En Render, conectar el repo usando render.yaml.
+3. En Netlify, conectar el repo y dejar que lea netlify.toml.
+4. Si modificás solo app.py o requirements.txt: despliega Render, Netlify no.
+5. Si modificás solo frontend-netlify/index.html: despliega Netlify, Render no.
+6. Si modificás render.yaml: Render procesa el cambio de configuración.
+7. Si modificás netlify.toml: Netlify despliega porque puede afectar su configuración.
+
+Brent realtime
+--------------
+El backend usa Yahoo Finance BZ=F como fuente principal para Brent y FRED DCOILBRENTEU solo como respaldo, porque FRED puede publicar con retraso.
+
+
+CAMBIO v19 - Brent NYMEX:BZW00
+- Brent ahora intenta primero Google Finance NYMEX:BZW00.
+- Si Google Finance no responde, usa Yahoo Finance BZ=F como fallback de mercado.
+- Si también falla y existe FRED_API_KEY, usa FRED DCOILBRENTEU como fallback oficial.
+- La versión esperada en /health es pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00.
