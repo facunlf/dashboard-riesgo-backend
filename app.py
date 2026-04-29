@@ -43,7 +43,7 @@ def not_found(error):
         "ok": False,
         "error": "Endpoint no encontrado en este backend. Probablemente Render sigue ejecutando una versión anterior.",
         "path": request.path,
-        "version": "pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00",
+        "version": "pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe",
         "availableEndpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance"]
     }), 404
 
@@ -1086,6 +1086,37 @@ def fetch_brent_latest(fred_key: str | None = None):
             errors.append(f"FRED DCOILBRENTEU: {error}")
 
     raise ValueError("; ".join(errors) if errors else "No se pudo obtener Brent")
+
+
+def fetch_vix_latest(fred_key: str | None = None):
+    """Prefer Google Finance INDEXCBOE:VIX latest quote; fallback to Yahoo ^VIX and then FRED VIXCLS."""
+    errors = []
+    try:
+        item = fetch_google_finance_latest("VIX", "INDEXCBOE", "CBOE Volatility Index")
+        item["note"] = "Cotización retrasada de mercado para INDEXCBOE:VIX; se usa como fuente principal del VIX actual."
+        return item
+    except Exception as error:
+        errors.append(f"Google Finance VIX:INDEXCBOE: {error}")
+
+    try:
+        item = fetch_yahoo_chart_latest("^VIX", "CBOE Volatility Index")
+        item["source"] = "Yahoo Finance ^VIX (fallback de mercado)"
+        item["note"] = "Fallback de mercado: se usa si Google Finance INDEXCBOE:VIX no responde."
+        return item
+    except Exception as error:
+        errors.append(f"Yahoo Finance ^VIX: {error}")
+
+    if fred_key:
+        try:
+            item = fetch_fred_latest("VIXCLS", fred_key)
+            item["source"] = "FRED VIXCLS (fallback oficial, no intradía)"
+            item["note"] = "Fallback final: FRED puede publicar VIX con retraso frente al mercado."
+            return item
+        except Exception as error:
+            errors.append(f"FRED VIXCLS: {error}")
+
+    raise ValueError("; ".join(errors) if errors else "No se pudo obtener VIX")
+
 
 def fred_yoy_source_label(series_id: str):
     labels = {
@@ -2575,7 +2606,7 @@ def market_logistics_proxy_score():
         pass
 
     try:
-        vix = fetch_fred_latest("VIXCLS", fred_key)
+        vix = fetch_vix_latest(fred_key)
         value = float(vix.get("latest", 0))
         points = clamp((value - 16) * 0.9, 0, 18)
         components.append(points)
@@ -3669,7 +3700,7 @@ def currency_dominance_payload(start: str, end: str):
 def index():
     return jsonify({
         "ok": True,
-        "message": "Backend PRO v22 Brent NYMEX BZW00 + Core PCE funcionando",
+        "message": "Backend PRO v20 Brent NYMEX BZW00 + VIX CBOE + Core PCE funcionando",
         "endpoints": ["/health", "/api/official-data", "/api/history", "/api/gscpi-history", "/api/currency-dominance", "/api/logistics-stress-news", "/api/global-pmi-news", "/api/macro-recession-news"],
     })
 
@@ -3681,7 +3712,7 @@ def health():
         "config": {
             "fredKeyConfigured": bool(os.environ.get("FRED_API_KEY", "").strip()),
             "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-            "version": "pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00",
+            "version": "pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe",
         }
     })
 
@@ -3712,7 +3743,7 @@ def official_data():
             "config": {
                 "fredKeyFromBackend": bool(os.environ.get("FRED_API_KEY", "").strip()),
                 "coreInflationSource": "FRED PCEPILFE / BEA Core PCE",
-                "version": "pro-free-logistics-dynamic-multisource-v19-brent-nymex-bzw00",
+                "version": "pro-free-logistics-dynamic-multisource-v20-brent-nymex-vix-cboe",
             }
         }
 
@@ -3752,16 +3783,21 @@ def official_data():
 
         jobs = {}
         with ThreadPoolExecutor(max_workers=12) as executor:
-            # Brent is market-sensitive: use NYMEX:BZW00 first so it can refresh
-            # during the day. If Google Finance fails, fetch_brent_latest falls back to Yahoo and then FRED.
+            # Brent and VIX are market-sensitive: use market quotes first so they can refresh
+            # during the day. If market sources fail, fall back to official FRED series.
             future = executor.submit(
                 lambda: stamp_update(fetch_brent_latest(fred_key), calculation_date, "Google Finance NYMEX:BZW00 / Yahoo BZ=F / FRED fallback")
             )
             jobs[future] = {"kind": "fred", "key": "brent", "label": "Brent", "series": "BZW00:NYMEX"}
 
+            future = executor.submit(
+                lambda: stamp_update(fetch_vix_latest(fred_key), calculation_date, "Google Finance INDEXCBOE:VIX / Yahoo ^VIX / FRED fallback")
+            )
+            jobs[future] = {"kind": "fred", "key": "vix", "label": "VIX", "series": "VIX:INDEXCBOE"}
+
             if fred_key:
                 for key, (series, label) in FRED_SERIES.items():
-                    if key == "brent":
+                    if key in ("brent", "vix"):
                         continue
                     future = executor.submit(
                         lambda s=series: stamp_update(fetch_fred_latest(s, fred_key), calculation_date, f"FRED {s}")
